@@ -299,6 +299,34 @@ actions:
 `mode: single` is right here: both automations are edge-triggered and there is
 nothing to queue if one fires while the other is still running.
 
+### Branching on the renderer
+
+`binary_sensor.<id>_renderer` complements the withdrawn controls. Unavailability
+stops a person from clicking; the sensor lets an automation not even try. An
+automation that presses `Play` while Qobuz holds the output targets an
+unavailable entity: Home Assistant refuses it and logs an error — harmless, but
+noise you can avoid with a condition.
+
+```yaml
+conditions:
+  - condition: state
+    entity_id: binary_sensor.<id>_renderer
+    state: "off"
+```
+
+The other way round, to react *to* a renderer — dimming the lights when someone
+casts to the player, without the local library doing the same:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.<id>_renderer
+    to: "on"
+```
+
+It pairs with `sensor.<id>_source`: the boolean answers "is an external source
+holding the output", the text answers "which one".
+
 ## Pi compatibility
 
 Nothing here is x86-specific. Verified against a stock **moOde 10.3.4** Pi
