@@ -1,0 +1,6 @@
+# Hold the broker credentials - never commit them. One per box (.conf, .conf.pi,
+# ...); only the sample is versioned.
+moode-mqtt.conf
+moode-mqtt.conf.*
+!moode-mqtt.conf.sample
+__pycache__/

@@ -1,0 +1,36 @@
+# moode-mqtt configuration - copy to moode-mqtt.conf and fill in.
+#
+# moode-mqtt.conf is gitignored: it holds broker credentials and must never be
+# committed. install.sh deploys it to /etc/moode-mqtt.conf as 0640 root:www-data.
+
+[broker]
+host = 192.168.1.x
+port = 1883
+username =
+password =
+client_id = moode-mqtt
+
+[moode]
+# Instance id: used in every topic and as the Home Assistant device identifier.
+# Changing it later creates a second device in HA, so pick it once.
+instance = moode
+friendly_name = moOde
+
+topic_prefix = moode
+discovery_prefix = homeassistant
+
+# How often the display and ALSA state are sampled, in seconds. MPD changes do
+# not wait for this: the idle connection wakes the publisher immediately.
+poll_interval = 1.0
+
+# Seconds the ALSA output has to stay closed before "Audio active" goes off.
+# MPD closes the device between tracks, so this must be a few seconds at least.
+# This is NOT the amp-off delay - hold that one in the Home Assistant automation
+# with `for:`, where it is easy to change.
+audio_off_delay = 5.0
+
+# Default step for a bare "up" / "dn" payload on cmd/volume.
+volume_step = 5
+
+mpd_host = localhost
+mpd_port = 6600

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 Julien Gainza
+
+[Unit]
+Description=moOde MQTT bridge
+# mpd is only a soft dependency: the bridge reconnects on its own and must keep
+# publishing display state even when MPD is down.
+After=network-online.target mpd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# www-data, the web server user: vol.sh writes cfg_system and the DB is owned by
+# www-data, so running as root would leave root-owned sqlite journal files
+# behind. www-data has NOPASSWD sudo in moOde, which is what `xset q` needs.
+User=www-data
+Group=www-data
+ExecStart=/usr/local/bin/moode-mqtt.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

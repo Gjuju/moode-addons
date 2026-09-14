@@ -1,0 +1,203 @@
+# moode-mqtt — moOde ↔ MQTT bridge with Home Assistant discovery
+
+Publishes moOde's state to an MQTT broker and accepts transport/volume commands
+back, so Home Assistant can drive automations. Validated both on moOde running
+on Debian x86_64 and on a stock moOde 10.3.4 Pi image; nothing in it is
+platform-specific.
+
+## Why not just Home Assistant's native MPD integration
+
+HA's MPD integration gives you a `media_player` for free, and it is a fine thing
+to run alongside this bridge. Three things it cannot do:
+
+- **Volume.** It talks to MPD directly. moOde's level lives in `cfg_system.volknob`
+  and, when `mpdmixer` is *hardware*, MPD does not carry it at all — so the WebUI
+  knob goes stale. This bridge routes every volume change through
+  `/var/www/util/vol.sh`, which owns `volknob`, `volmute` and the amixer-vs-mpc
+  choice.
+- **Non-MPD sources.** AirPlay, Spotify Connect, Qobuz, Bluetooth and line-in
+  never touch MPD. This bridge reads the ALSA substream instead, so they count.
+- **The local display.** Not visible to MPD at all.
+
+Note that Home Assistant has **no `media_player` platform over MQTT discovery**,
+so what appears in HA is sensors, buttons, a number and a switch — which is what
+automations want anyway.
+
+## Install
+
+```bash
+cp moode-mqtt.conf.sample moode-mqtt.conf     # fill in the broker credentials
+rsync -a --exclude .git ./ moode@<box>:~/moode-mqtt/
+ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
+```
+
+`moode-mqtt.conf` is **gitignored** — it holds the broker password and is
+deployed to `/etc/moode-mqtt.conf` as `0640 root:www-data`. Only
+`moode-mqtt.conf.sample` is committed.
+
+### More than one box
+
+Keep one config per box (`moode-mqtt.conf`, `moode-mqtt.conf.pi`, …) — all
+gitignored by the `moode-mqtt.conf.*` rule. Both `instance` **and** `client_id`
+must differ between boxes:
+
+- a shared `instance` puts both boxes on the same topics and on the same Home
+  Assistant device;
+- a shared `client_id` is worse and less obvious — MQTT allows one connection
+  per client id, so the broker kicks each box off as the other connects, and
+  they flap forever.
+
+Deploy a second box by keeping its own config out of the sync and landing it
+under the expected name:
+
+```bash
+rsync -a --exclude .git --exclude __pycache__ --exclude 'moode-mqtt.conf' \
+      ./ moode@<box>:~/moode-mqtt/
+scp moode-mqtt.conf.pi moode@<box>:~/moode-mqtt/moode-mqtt.conf
+ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
+```
+
+The installer pulls `python3-paho-mqtt` and `python3-musicpd` (both in trixie:
+paho 2.1.0, musicpd 0.9.2), installs the daemon plus its unit, and checks that
+the broker connection actually came up — a wrong password otherwise leaves the
+service `active` and silent.
+
+Re-runnable; it only restarts what changed.
+
+## Topics
+
+Instance id is `instance` from the config. Everything is published **retained,
+on change only**.
+
+| topic | payload |
+|---|---|
+| `moode/<id>/availability` | `online` / `offline` (MQTT LWT) |
+| `moode/<id>/audio` | `ON` / `OFF` — the ALSA output substream, any source |
+| `moode/<id>/player` | JSON: `state`, `volume`, `mute`, `artist`, `title`, `album`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` |
+| `moode/<id>/display/app` | `webui` / `peppy` / `none` |
+| `moode/<id>/display/power` | `ON` / `OFF` |
+
+`player` carries `elapsed`, which changes every cycle, so change detection
+deliberately ignores that one field: the topic is republished when anything else
+moves, and otherwise once every 30 s (`PLAYER_REFRESH`). Without that the broker
+would get one retained message per second forever.
+
+| command topic | payload |
+|---|---|
+| `moode/<id>/cmd/volume` | `up` · `dn` · `up 5` · `dn 5` · `0`–`100` |
+| `moode/<id>/cmd/mute` | `on` · `off` (absolute, not a toggle) |
+| `moode/<id>/cmd/transport` | `play` · `pause` · `stop` · `toggle` · `next` · `previous` |
+
+`toggle` follows the WebUI rule: a radio stream is **stopped**, anything else is
+**paused**. A radio is detected the way `inc/mpd.php:764` does it — an `http`
+file with no duration. Not by the `Radio station` artist label the WebUI shows:
+that label is produced by moOde's own PHP rendering and never reaches MPD, which
+reports whatever tags the stream carries, often none at all.
+
+## Home Assistant
+
+Discovery is automatic: the box shows up as one device named after
+`friendly_name`. Entities, where `<id>` is your `instance` value:
+`binary_sensor.<id>_audio`, `binary_sensor.<id>_display_power`,
+`sensor.<id>_{state,title,artist,album,display_app}`, `number.<id>_volume`,
+`switch.<id>_mute`, and six buttons (play, pause, stop, toggle, next, previous).
+
+Below, an amp switched on with the music and off after a silence — one
+automation each, in the editor's YAML mode, with `<id>` and `switch.amp`
+replaced by your own. The silence delay lives **in HA** with `for:`, not in the
+bridge, so it can be retuned without touching the player.
+
+Amp on as soon as anything plays:
+
+```yaml
+description: ''
+mode: single
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.<id>_audio
+    to: "on"
+conditions: []
+actions:
+  - action: switch.turn_on
+    target:
+      entity_id: switch.amp
+```
+
+Amp off after 15 minutes of silence:
+
+```yaml
+description: ''
+mode: single
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.<id>_audio
+    to: "off"
+    for: "00:15:00"
+conditions: []
+actions:
+  - action: switch.turn_off
+    target:
+      entity_id: switch.amp
+```
+
+`mode: single` is right here: both automations are edge-triggered and there is
+nothing to queue if one fires while the other is still running.
+
+## Pi compatibility
+
+Nothing here is x86-specific. Verified against a stock **moOde 10.3.4** Pi
+image on trixie (2026-09-14), with the bridge deployed and driven from Home
+Assistant:
+
+- systemd is PID 1 and `is-system-running` reports `running`, so the unit works.
+  moOde's own worker runs from `rc.local` as root there, which this service is
+  independent of.
+- `/var/local/www/db/moode-sqlite3.db` is owned by `www-data` on the Pi exactly
+  as on x86, so `vol.sh` works from a `www-data` daemon. This was the one thing
+  that could have forced a different user, and it does not.
+- `www-data ALL=(ALL) NOPASSWD: ALL` is present on stock moOde too.
+- `python3-musicpd` is already installed; `python3-paho-mqtt` (2.1.0) comes from
+  apt via `install.sh`.
+
+**Headless boxes**: that Pi had no local display (`localdisplay` disabled, no
+Xorg). `xset q` then answers nothing, and the bridge publishes **nothing** on
+`display/power` rather than a made-up `OFF` — the HA entity stays `unknown`,
+which is the truth. It also backs the check off to once a minute instead of
+forking a `sudo xset` every second for an answer that will never come.
+`display/app` still reports `none`, which is accurate: no app is on screen.
+
+## Measured behaviour and caveats
+
+**Do not drive the amp from the display state.** Two unrelated mechanisms blank
+the screen and only one of them has anything to do with audio:
+
+- `worker.php` `chkPeppyScnBlank()` implements moOde's documented "screen off
+  after playback has stopped" (`scn_blank`) — but `worker.php:2029` gates it on
+  `peppy_display == '1'`, so it only counts **while Peppy is on screen**.
+- `.xinitrc` arms `xset s 600 0` / `xset dpms 600 0 0`: plain X **input**
+  inactivity, 10 minutes, entirely unrelated to whether music is playing.
+
+Measured on an x86 box with a touch panel (2026-09-14): `scn_blank=600`,
+`peppy_display=0`, `local_display=1`, `peppy_scn_blank_active=0`, and yet
+`xset q` reported `Monitor is in Standby`. The screen was off, and `scn_blank` had nothing to do
+with it — it was the DPMS timeout. With `touchmon_svc=1` the two also fight each
+other: playback stops → touchmon switches back to the WebUI within seconds →
+`peppy_display` drops to 0 → the `scn_blank` countdown stops before it finishes.
+That last step is read from the code and consistent with the snapshot above, not
+an observed full cycle.
+
+Hence `audio`, computed from the ALSA substream, is the signal for the amp;
+`display/*` is published for information.
+
+**`audio` debounce.** MPD closes the ALSA device between tracks, which is why
+`touchmon.php` requires `TOUCHMON_CLOSED_COUNT` consecutive closed readings. The
+bridge does the same with `audio_off_delay` (default 5 s). It turns **on**
+immediately.
+
+**No writes to `cfg_system`.** The database is opened read-only. Writing it
+behind moOde's back desyncs its PHP session cache, and the WebUI then looks
+stuck. Every change goes through `vol.sh` or `mpc`.
+
+**Runs as `www-data`**, the web server user — the sqlite DB is owned by
+`www-data`, so a root daemon would leave root-owned journal files behind.
+`www-data` has NOPASSWD sudo in moOde, which is what reading `xset q` needs.
