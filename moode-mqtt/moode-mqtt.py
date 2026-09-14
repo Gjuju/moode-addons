@@ -513,13 +513,20 @@ class Bridge:
 
         self.publish('audio', 'ON' if self.audio_state else 'OFF')
 
-        # Grey out the volume control in Home Assistant rather than letting it
-        # move something that is not what you hear. A renderer sets its own
-        # level from its app, and on a hardware mixer raising the DAC to
-        # compensate would stay raised once MPD takes the output back - loud.
+        # Withdraw the controls in Home Assistant rather than letting them move
+        # something they do not reach. moOde does the same: its renderer
+        # indicator covers the playback screen entirely.
+        #
+        # Transport: a renderer plays while MPD is stopped, so these reach MPD
+        # and not what is heard.
+        # Volume: the renderer sets its own level from its app, and on a
+        # hardware mixer raising the DAC to compensate would stay raised once
+        # MPD takes the output back - loud. Also withdrawn on a fixed 0dB
+        # output, where vol.sh changes nothing at all.
         scope_now = volume_scope(cfg_rows)
-        usable = scope_now != 'none' and not renderer_active
-        self.publish('volume/available', 'online' if usable else 'offline')
+        self.publish('controls/available', 'offline' if renderer_active else 'online')
+        volume_usable = scope_now != 'none' and not renderer_active
+        self.publish('volume/available', 'online' if volume_usable else 'offline')
 
         if cfg_rows.get('peppy_display') == '1':
             app = 'peppy'
@@ -666,6 +673,12 @@ class Bridge:
             'device_class': 'running',
             'icon': 'mdi:speaker',
         })
+        announce('binary_sensor', 'renderer', {
+            'name': 'Renderer',
+            'state_topic': player,
+            'value_template': "{{ 'ON' if value_json.renderer_active else 'OFF' }}",
+            'icon': 'mdi:cast-audio',
+        })
         announce('binary_sensor', 'display_power', {
             'name': 'Display',
             'state_topic': self.topic('display/power'),
@@ -732,7 +745,7 @@ class Bridge:
                 'command_topic': self.topic('cmd/transport'),
                 'payload_press': cmd,
                 'icon': icon,
-            })
+            }, extra_availability=self.topic('controls/available'))
 
     # Threads
 

@@ -99,6 +99,7 @@ on change only**.
 | `moode/<id>/availability` | `online` / `offline` (MQTT LWT) |
 | `moode/<id>/audio` | `ON` / `OFF` — the ALSA output substream, any source |
 | `moode/<id>/player` | JSON, see below |
+| `moode/<id>/controls/available` | `online` / `offline` — whether the transport buttons should be used |
 | `moode/<id>/volume/available` | `online` / `offline` — whether the volume control should be used |
 | `moode/<id>/display/app` | `webui` / `peppy` / `none` |
 | `moode/<id>/display/power` | `ON` / `OFF` |
@@ -150,18 +151,30 @@ reports:
 | `mpd` | `mpc volume`, MPD alone | **controls nothing audible**; `volume` is published as null |
 | `none` | nothing — Fixed 0dB, `vol.sh` exits immediately | always null |
 
-So the **volume control is published as unavailable** while a renderer plays, or
-whenever the output is fixed at 0dB: `moode/<id>/volume/available` goes
-`offline`, and the HA number and mute entities list it alongside the bridge's
-own availability with `availability_mode: all`. Home Assistant greys them out —
-nothing to read wrongly, nothing to drag by accident, no automation setting a
-level that will not be heard.
+So **every control is published as unavailable while a renderer plays** — the
+six transport buttons, the volume and the mute. Each lists its gate alongside
+the bridge's own availability with `availability_mode: all`, and Home Assistant
+greys them out: nothing to read wrongly, nothing to press or drag by accident,
+no automation acting on something it does not reach.
 
-That is deliberately stricter than moOde itself, which only disables its knob
-for a fixed 0dB output ([`playerlib.js`]): on a hardware mixer moOde lets you
-raise the DAC during a renderer, and that raise **stays** once MPD takes the
-output back — which is loud, and much worse when an automation does it rather
-than a person. The renderer's own level belongs to its app.
+Two gates, because the reasons differ:
+
+| topic | goes offline when | gates |
+|---|---|---|
+| `controls/available` | a renderer is active | the six transport buttons |
+| `volume/available` | a renderer is active, **or** the output is a fixed 0dB | volume, mute |
+
+The transport buttons talk to MPD, which is stopped during a renderer, so they
+do not reach what is playing. The volume gate adds the fixed 0dB case, where
+`vol.sh` exits without changing anything whatever is playing.
+
+moOde does the same in its own way: its renderer indicator covers the playback
+screen entirely, so its transport controls are not reachable either. The volume
+is the one place this bridge is stricter — moOde only disables its knob for a
+fixed 0dB output, and on a hardware mixer it lets you raise the DAC during a
+renderer. That raise **stays** once MPD takes the output back, which is loud,
+and much worse when an automation does it rather than a person. The renderer's
+own level belongs to its app.
 
 `volume` keeps carrying the real knob value throughout, since it is a true piece
 of moOde's state; only the *control* is withdrawn.
@@ -234,7 +247,8 @@ reports whatever tags the stream carries, often none at all.
 
 Discovery is automatic: the box shows up as one device named after
 `friendly_name`. Entities, where `<id>` is your `instance` value:
-`binary_sensor.<id>_audio`, `binary_sensor.<id>_display_power`,
+`binary_sensor.<id>_audio`, `binary_sensor.<id>_renderer`,
+`binary_sensor.<id>_display_power`,
 `sensor.<id>_{state,title,artist,album,station,source,quality,display_app}`,
 `number.<id>_volume`, `switch.<id>_mute`, and six buttons (play, pause, stop,
 toggle, next, previous).
