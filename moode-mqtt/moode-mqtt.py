@@ -26,6 +26,7 @@ import configparser
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -190,6 +191,12 @@ def load_config():
         'poll_interval': float(moode.get('poll_interval', 1.0)),
         'audio_off_delay': float(moode.get('audio_off_delay', 5.0)),
         'volume_step': int(moode.get('volume_step', 5)),
+        # AirPlay artwork is cached as a path relative to moOde's web root, unlike
+        # the absolute URLs Spotify and Qobuz hand over, so it needs a base to be
+        # reachable from Home Assistant. The hostname works when mDNS resolves;
+        # set this to http://<ip> when it does not.
+        'web_base_url': (moode.get('web_base_url', '')
+                         or 'http://%s.local' % socket.gethostname()).rstrip('/'),
         'mpd_host': moode.get('mpd_host', 'localhost'),
         'mpd_port': int(moode.get('mpd_port', 6600)),
     }
@@ -535,7 +542,7 @@ class Bridge:
             # What the renderer says it received, e.g. "FLAC 16/44.1 kHz"
             'source_format': (meta.get('sformat') or '').strip(),
             'file': '' if renderer_active else song.get('file', ''),
-            'cover_url': (meta.get('cover_url') or '').strip(),
+            'cover_url': self.absolute_cover(meta.get('cover_url') or ''),
             # Raw extras: useful in templates, deliberately not exposed as
             # entities since they are absent often enough to blink.
             'genre': song.get('genre', ''),
@@ -558,6 +565,14 @@ class Bridge:
             self.player_sig = sig
             self.player_published_at = now
             self.publish('player', json.dumps(player, sort_keys=True), force=True)
+
+    def absolute_cover(self, url):
+        """Spotify and Qobuz give absolute URLs; AirPlay gives a path under
+        moOde's web root. Anything not already absolute gets the base prefixed."""
+        url = url.strip()
+        if not url or url.startswith(('http://', 'https://')):
+            return url
+        return '%s/%s' % (self.cfg['web_base_url'], url.lstrip('/'))
 
     # Home Assistant discovery
 
@@ -623,6 +638,16 @@ class Bridge:
                 'value_template': '{{ value_json.%s }}' % field,
                 'icon': icon,
             })
+        # Declared but off by default: nothing consumes the artwork yet, and an
+        # entity the user can switch on in one click beats one that has to be
+        # added later. HA fetches the URL itself, so the box must be reachable
+        # from it - see web_base_url for the AirPlay case.
+        announce('image', 'cover', {
+            'name': 'Cover',
+            'url_topic': player,
+            'url_template': '{{ value_json.cover_url }}',
+            'enabled_by_default': False,
+        })
         announce('number', 'volume', {
             'name': 'Volume',
             'state_topic': player,

@@ -144,7 +144,16 @@ track from before. Reporting those would be plainly wrong, so:
 - `file`, `station`, `audio` and `is_radio` are blanked — they describe MPD's
   idea of the world, which is stale at that moment.
 
-Two measured traps in those caches:
+Measured on all four, with the bridge running:
+
+| renderer | artist/title/album | `source_format` | notes |
+|---|---|---|---|
+| AirPlay | yes | `ALAC 16/44.1 kHz 2ch` | artwork path is **relative** |
+| Spotify | yes | `Vorbis 320 kbps` | duration in ms |
+| Qobuz | yes | `FLAC 16/44.1 kHz` | duration in seconds |
+| Bluetooth | **no** | — | moOde keeps no cache for it; `source`, `state` and `quality` still work |
+
+Three measured traps in those caches:
 
 - **the duration unit is not the same across renderers.** AirPlay and Spotify
   report milliseconds, Qobuz reports seconds. moOde carries the same split in
@@ -152,6 +161,10 @@ Two measured traps in those caches:
   `363866` and a Qobuz one as `501`.
 - **an inactive renderer leaves an empty file, not a stale one** — moOde
   truncates the cache to zero — so there is no risk of reading yesterday's track.
+- **AirPlay's `cover_url` is a path, not a URL** (`imagesw/airplay-covers/…`),
+  where Spotify and Qobuz give absolute `https://` links. The bridge prefixes it
+  with `web_base_url`, which defaults to `http://<hostname>.local` — set it to
+  `http://<ip>` in the config when mDNS does not resolve from Home Assistant.
 
 `quality` is read from ALSA `hw_params` rather than from MPD, precisely so it
 keeps working here: it is what the DAC is actually fed, whoever opened it.
@@ -185,6 +198,11 @@ Discovery is automatic: the box shows up as one device named after
 `sensor.<id>_{state,title,artist,album,station,source,quality,display_app}`,
 `number.<id>_volume`, `switch.<id>_mute`, and six buttons (play, pause, stop,
 toggle, next, previous).
+
+An `image.<id>_cover` entity is declared **disabled by default**: the artwork is
+published but nothing consumes it yet, so enable it in HA the day you want it
+rather than carrying an entity nobody reads. Home Assistant fetches the URL
+itself, so the box has to be reachable from it.
 
 Below, an amp switched on with the music and off after a silence — one
 automation each, in the editor's YAML mode, with `<id>` and `switch.amp`

@@ -32,5 +32,11 @@ audio_off_delay = 5.0
 # Default step for a bare "up" / "dn" payload on cmd/volume.
 volume_step = 5
 
+# Base URL of this box's web server, used to make AirPlay artwork reachable:
+# its cache stores a path relative to the web root, not an absolute URL like
+# Spotify and Qobuz do. Defaults to http://<hostname>.local; set an IP here when
+# mDNS does not resolve from Home Assistant.
+web_base_url =
+
 mpd_host = localhost
 mpd_port = 6600
