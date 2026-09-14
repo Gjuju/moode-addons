@@ -25,15 +25,65 @@ automations want anyway.
 
 ## Install
 
+You need a moOde player, an MQTT broker already running somewhere on your
+network (Mosquitto, the Home Assistant add-on, …), and SSH access to the player.
+`git` is part of the moOde image, so nothing has to be installed first.
+
+**On the player**, as the moOde user:
+
 ```bash
-cp moode-mqtt.conf.sample moode-mqtt.conf     # fill in the broker credentials
-rsync -a --exclude .git ./ moode@<box>:~/moode-mqtt/
-ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
+git clone https://github.com/Gjuju/moode-addons.git
+cd moode-addons/moode-mqtt
+cp moode-mqtt.conf.sample moode-mqtt.conf
+nano moode-mqtt.conf        # broker host, username, password, instance
+sudo ./install.sh
+```
+
+The installer pulls `python3-paho-mqtt` and `python3-musicpd` from apt, installs
+the daemon and its systemd unit, enables it, and then checks that the broker
+connection actually came up — a wrong password otherwise leaves the service
+`active` and silent. Expect:
+
+```
+[ok] service is running
+[ok] connected to the broker
+[ok] vol.sh present
+```
+
+The entities appear in Home Assistant on their own, under a device named after
+`friendly_name`. Nothing to add to your HA configuration.
+
+To update later: `git pull` in that directory, then `sudo ./install.sh` again.
+It is re-runnable and only restarts what changed; your `moode-mqtt.conf` is
+never overwritten.
+
+**What to fill in.** Only the first block usually matters:
+
+```ini
+[broker]
+host = 192.168.1.x
+username =                  # leave empty for an anonymous broker
+password =
+
+[moode]
+instance = moode            # topic prefix and HA device id - pick it once
+friendly_name = moOde       # the name shown in Home Assistant
 ```
 
 `moode-mqtt.conf` is **gitignored** — it holds the broker password and is
 deployed to `/etc/moode-mqtt.conf` as `0640 root:www-data`. Only
-`moode-mqtt.conf.sample` is committed.
+`moode-mqtt.conf.sample` is committed, so a `git pull` never touches your
+credentials.
+
+### Deploying from another machine
+
+Editing on a workstation and pushing to the player works too, and is what the
+multi-box recipe below builds on:
+
+```bash
+rsync -a --exclude .git ./ moode@<box>:~/moode-mqtt/
+ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
+```
 
 ### More than one box
 
@@ -56,13 +106,6 @@ rsync -a --exclude .git --exclude __pycache__ --exclude 'moode-mqtt.conf' \
 scp moode-mqtt.conf.pi moode@<box>:~/moode-mqtt/moode-mqtt.conf
 ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
 ```
-
-The installer pulls `python3-paho-mqtt` and `python3-musicpd` (both in trixie:
-paho 2.1.0, musicpd 0.9.2), installs the daemon plus its unit, and checks that
-the broker connection actually came up — a wrong password otherwise leaves the
-service `active` and silent.
-
-Re-runnable; it only restarts what changed.
 
 ## Uninstall
 
