@@ -513,6 +513,14 @@ class Bridge:
 
         self.publish('audio', 'ON' if self.audio_state else 'OFF')
 
+        # Grey out the volume control in Home Assistant rather than letting it
+        # move something that is not what you hear. A renderer sets its own
+        # level from its app, and on a hardware mixer raising the DAC to
+        # compensate would stay raised once MPD takes the output back - loud.
+        scope_now = volume_scope(cfg_rows)
+        usable = scope_now != 'none' and not renderer_active
+        self.publish('volume/available', 'online' if usable else 'offline')
+
         if cfg_rows.get('peppy_display') == '1':
             app = 'peppy'
         elif cfg_rows.get('local_display') == '1':
@@ -560,11 +568,10 @@ class Bridge:
         player = {
             'state': state,
             # The knob, not MPD's own volume: with a hardware mixer MPD does
-            # not carry moOde's level. Null rather than a number that controls
-            # nothing: with a software mixer the knob is MPD-only, so while a
-            # renderer plays it neither describes nor changes what is heard.
-            'volume': None if (scope == 'none' or (scope == 'mpd' and renderer_active))
-                      else int(cfg_rows.get('volknob') or 0),
+            # not carry moOde's level. Always the real value - whether the
+            # control should be *used* right now is carried by its own
+            # availability topic instead.
+            'volume': int(cfg_rows.get('volknob') or 0),
             'volume_scope': scope,
             'mute': cfg_rows.get('volmute') == '1',
             'source': display_source(cfg_rows, is_radio),
@@ -631,13 +638,21 @@ class Bridge:
         avail = self.topic('availability')
         player = self.topic('player')
 
-        def announce(platform, object_id, config):
+        def announce(platform, object_id, config, extra_availability=None):
             config.update({
                 'device': dev,
-                'availability_topic': avail,
                 'unique_id': '%s_%s' % (inst, object_id),
                 'object_id': '%s_%s' % (inst, object_id),
             })
+            if extra_availability:
+                # availability_mode 'all': available only while every listed
+                # topic says so, so this adds to the bridge's own liveness
+                # rather than replacing it.
+                config['availability'] = [{'topic': avail},
+                                          {'topic': extra_availability}]
+                config['availability_mode'] = 'all'
+            else:
+                config['availability_topic'] = avail
             self.client.publish(
                 '%s/%s/%s/%s/config' % (self.cfg['discovery_prefix'], platform,
                                         inst, object_id),
@@ -696,7 +711,7 @@ class Bridge:
             'command_topic': self.topic('cmd/volume'),
             'min': 0, 'max': 100, 'step': 1,
             'icon': 'mdi:volume-high',
-        })
+        }, extra_availability=self.topic('volume/available'))
         announce('switch', 'mute', {
             'name': 'Mute',
             'state_topic': player,
@@ -705,7 +720,7 @@ class Bridge:
             'command_topic': self.topic('cmd/mute'),
             'payload_on': 'on', 'payload_off': 'off',
             'icon': 'mdi:volume-off',
-        })
+        }, extra_availability=self.topic('volume/available'))
         for cmd, label, icon in (('toggle', 'Play/Pause', 'mdi:play-pause'),
                                  ('play', 'Play', 'mdi:play'),
                                  ('pause', 'Pause', 'mdi:pause'),

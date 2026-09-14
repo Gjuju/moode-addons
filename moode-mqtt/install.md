@@ -99,6 +99,7 @@ on change only**.
 | `moode/<id>/availability` | `online` / `offline` (MQTT LWT) |
 | `moode/<id>/audio` | `ON` / `OFF` — the ALSA output substream, any source |
 | `moode/<id>/player` | JSON, see below |
+| `moode/<id>/volume/available` | `online` / `offline` — whether the volume control should be used |
 | `moode/<id>/display/app` | `webui` / `peppy` / `none` |
 | `moode/<id>/display/power` | `ON` / `OFF` |
 
@@ -107,7 +108,7 @@ on change only**.
 | key | value |
 |---|---|
 | `state` | `play` / `pause` / `stop` |
-| `volume`, `mute` | moOde's knob level and mute flag; `volume` is **null** when the knob controls nothing (see below) |
+| `volume`, `mute` | moOde's knob level and mute flag |
 | `volume_scope` | `hardware` / `mpd` / `none` — what the knob attenuates |
 | `artist`, `title`, `album` | **exactly what the source reports, or empty** |
 | `station` | stream `Name`, empty off a radio |
@@ -149,10 +150,26 @@ reports:
 | `mpd` | `mpc volume`, MPD alone | **controls nothing audible**; `volume` is published as null |
 | `none` | nothing — Fixed 0dB, `vol.sh` exits immediately | always null |
 
-A null `volume` leaves the HA number entity unknown rather than showing a slider
-that moves without changing anything. `cmd/volume` is still accepted in that
-state — it sets MPD's level for when MPD plays again — but it will not be heard
-while the renderer holds the output.
+So the **volume control is published as unavailable** while a renderer plays, or
+whenever the output is fixed at 0dB: `moode/<id>/volume/available` goes
+`offline`, and the HA number and mute entities list it alongside the bridge's
+own availability with `availability_mode: all`. Home Assistant greys them out —
+nothing to read wrongly, nothing to drag by accident, no automation setting a
+level that will not be heard.
+
+That is deliberately stricter than moOde itself, which only disables its knob
+for a fixed 0dB output ([`playerlib.js`]): on a hardware mixer moOde lets you
+raise the DAC during a renderer, and that raise **stays** once MPD takes the
+output back — which is loud, and much worse when an automation does it rather
+than a person. The renderer's own level belongs to its app.
+
+`volume` keeps carrying the real knob value throughout, since it is a true piece
+of moOde's state; only the *control* is withdrawn.
+
+moOde's own ceiling still applies to everything this bridge does, because all
+volume goes through `vol.sh`: set **Configure → Audio → Max volume**
+(`volume_mpd_max`) and neither the WebUI nor Home Assistant can exceed it. That
+is a moOde setting, not something this bridge duplicates.
 
 ### While a renderer plays
 
