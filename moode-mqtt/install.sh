@@ -76,9 +76,9 @@ deploy moode-mqtt.service /etc/systemd/system/moode-mqtt.service  0644 root:root
 say
 say "-- Service"
 [ "$CHANGED_UNIT" = 1 ] && systemctl daemon-reload
-systemctl enable --quiet moode-mqtt 2>/dev/null
+systemctl enable --quiet moode-mqtt
 systemctl restart moode-mqtt
-ok "moode-mqtt enabled and restarted"
+say "     enable + restart issued"
 
 say
 say "-- Checks"
@@ -100,6 +100,16 @@ if systemctl is-active --quiet moode-mqtt; then
 	ok "service is running"
 else
 	warn "service is not running - journalctl -u moode-mqtt -n 30"
+	RC=1
+fi
+
+# Checked rather than announced: without this the bridge works until the next
+# reboot and then silently does not come back.
+if [ "$(systemctl is-enabled moode-mqtt 2>/dev/null)" = "enabled" ]; then
+	ok "enabled at boot"
+else
+	warn "NOT enabled at boot - it will not restart after a reboot"
+	warn "  try: sudo systemctl enable moode-mqtt"
 	RC=1
 fi
 
