@@ -73,12 +73,15 @@ def display_source(cfg_rows, is_radio):
     return 'Radio' if is_radio else 'Library'
 
 
-def format_quality(params):
+def format_quality(params, status=None):
     """Readable output format from ALSA hw_params.
 
     Preferred over MPD's status 'audio' because MPD reports nothing at all while
     a renderer holds the device, and this is the real thing anyway: resampling
     and CamillaDSP included.
+
+    The format designators handled here mirror moOde's own parser in
+    inc/alsa.php (getAlsaHwParams) - keep the two in step.
     """
     if not params:
         return ''
@@ -86,6 +89,18 @@ def format_quality(params):
     rate = (params.get('rate', '') or '').split(' ')[0]
     if not fmt or not rate.isdigit():
         return ''
+
+    khz_only = '%g kHz' % (int(rate) / 1000)
+
+    # S/PDIF carries its samples in a subframe whose name says nothing about the
+    # depth, so the digits in it are not a bit count. MPD knows the real depth
+    # when it is the one playing; nothing does otherwise, so report the rate
+    # alone rather than inventing a number.
+    if fmt == 'IEC958_SUBFRAME_LE':
+        mpd_bits = ((status or {}).get('audio') or '').split(':')
+        if len(mpd_bits) > 1 and mpd_bits[1].isdigit():
+            return '%s bit / %s' % (mpd_bits[1], khz_only)
+        return khz_only
 
     head = fmt.split('_')[0]                       # S32, S24, FLOAT, DSD
     if fmt.startswith('DSD'):
@@ -243,7 +258,9 @@ def read_hw_params(cfg_rows):
             text = fh.read().strip()
     except OSError:
         return None
-    if text == 'closed' or not text:
+    # moOde's own parser treats both of these as "nothing playing" (inc/alsa.php,
+    # getAlsaHwParams).
+    if not text or text in ('closed', 'no setup'):
         return None
 
     params = {}
@@ -537,7 +554,7 @@ class Bridge:
                      else song.get('title', '').strip(),
             'album': (meta.get('album') or '').strip() if renderer_active
                      else song.get('album', '').strip(),
-            'quality': format_quality(hw),
+            'quality': format_quality(hw, status),
             'audio': '' if renderer_active else status.get('audio', ''),
             # What the renderer says it received, e.g. "FLAC 16/44.1 kHz"
             'source_format': (meta.get('sformat') or '').strip(),

@@ -268,6 +268,32 @@ which is the truth. It also backs the check off to once a minute instead of
 forking a `sudo xset` every second for an answer that will never come.
 `display/app` still reports `none`, which is accurate: no app is on screen.
 
+## Why not call moOde's own code
+
+moOde already implements most of this: `getAlsaHwParams()` (`inc/alsa.php`),
+`chkRendererActive()` (`inc/common.php`), the radio test in `inc/mpd.php`, and
+`audioinfo.php`, which consolidates source, metadata cache and formats exactly
+as the bridge does. Reusing it directly was ruled out for two reasons:
+
+- **No MQTT client for PHP in Debian.** `apt-cache search mqtt` returns no PHP
+  binding, so a PHP daemon — the natural way to `require` moOde's own includes,
+  as `worker.php` and `touchmon.php` do — would need a composer or PECL
+  dependency, outside the distribution.
+- **Those endpoints are pages, not an API.** `audioinfo.php` opens a PHP session
+  and returns presentation data; `engine-mpd.php` is long-polling built for the
+  browser. Calling them once a second means forking php-fpm at 1 Hz and tying
+  this bridge to moOde's front end.
+
+So the bridge reads `/proc` and the database directly, and **duplicates a small
+amount of moOde's logic** — which is a real cost, not a free choice: the ALSA
+format designators, the radio test and the renderer flags all exist in moOde
+already. The duplicated spots carry a pointer to their original; keep them in
+step when rebasing onto a new moOde.
+
+One case makes the cost concrete: `IEC958_SUBFRAME_LE`, the S/PDIF designator,
+contains digits that are not a bit depth. moOde handles it explicitly; this
+parser first reported `958 bit / 44.1 kHz` for it.
+
 ## Measured behaviour and caveats
 
 **Do not drive the amp from the display state.** Two unrelated mechanisms blank
