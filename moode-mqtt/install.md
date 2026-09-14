@@ -108,11 +108,13 @@ on change only**.
 |---|---|
 | `state` | `play` / `pause` / `stop` |
 | `volume`, `mute` | moOde's knob level and mute flag |
-| `artist`, `title`, `album` | **exactly what MPD reports, or empty** |
-| `station` | `Name` of the stream, empty off a radio |
+| `artist`, `title`, `album` | **exactly what the source reports, or empty** |
+| `station` | stream `Name`, empty off a radio |
 | `source` | `Radio`, `Library`, or the active renderer |
-| `quality` | `24 bit / 96 kHz`, `DSD64` — readable form of `audio` |
-| `audio` | raw MPD field, `44100:24:2` |
+| `quality` | `24 bit / 96 kHz`, `DSD64` — from ALSA, so every source |
+| `source_format` | what a renderer received: `Vorbis 320 kbps`, `FLAC 16/44.1 kHz` |
+| `cover_url` | renderer artwork URL, empty otherwise |
+| `audio` | raw MPD field `44100:24:2`, empty while a renderer plays |
 | `genre`, `date`, `bitrate`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` | as reported |
 
 **One key, one value.** A field carries the value MPD gives for it, or nothing.
@@ -128,6 +130,31 @@ than guessed from text: moOde's `cfg_system` renderer flags, then `is_radio`.
 It is also why the MPD text fields are **blanked while a renderer is active** —
 MPD is stopped then, and its `currentsong` still describes the track from
 before, so carrying it over would report a song that is not playing.
+
+### While a renderer plays
+
+AirPlay, Spotify, Qobuz, Bluetooth and line-in never touch MPD, and MPD is
+*stopped* during them — its `currentsong` and its `state` still describe the
+track from before. Reporting those would be plainly wrong, so:
+
+- `artist`, `title`, `album`, `duration` and `cover_url` come from the
+  renderer's own cache, which moOde keeps as JSON with plain keys:
+  `/var/local/www/{apl,spot,qbz}meta.json`. Still one key, one value.
+- `state` is taken from the ALSA device being open, not from MPD.
+- `file`, `station`, `audio` and `is_radio` are blanked — they describe MPD's
+  idea of the world, which is stale at that moment.
+
+Two measured traps in those caches:
+
+- **the duration unit is not the same across renderers.** AirPlay and Spotify
+  report milliseconds, Qobuz reports seconds. moOde carries the same split in
+  `playerlib.js` (`timeDivisor`). Measured: a Spotify track came back as
+  `363866` and a Qobuz one as `501`.
+- **an inactive renderer leaves an empty file, not a stale one** — moOde
+  truncates the cache to zero — so there is no risk of reading yesterday's track.
+
+`quality` is read from ALSA `hw_params` rather than from MPD, precisely so it
+keeps working here: it is what the DAC is actually fed, whoever opened it.
 
 In automations, treat an empty field as "not provided":
 `{{ states('sensor.<id>_artist') | length > 0 }}` rather than a test against

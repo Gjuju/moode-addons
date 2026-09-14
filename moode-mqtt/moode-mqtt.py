@@ -72,34 +72,55 @@ def display_source(cfg_rows, is_radio):
     return 'Radio' if is_radio else 'Library'
 
 
-def format_quality(status):
-    """Human-readable output format from MPD's status 'audio' field.
+def format_quality(params):
+    """Readable output format from ALSA hw_params.
 
-    That field is what actually reaches the device - resampling and CamillaDSP
-    included - not the file's own format tag. Empty when nothing is playing:
-    there is no output format to report then.
+    Preferred over MPD's status 'audio' because MPD reports nothing at all while
+    a renderer holds the device, and this is the real thing anyway: resampling
+    and CamillaDSP included.
     """
-    audio = status.get('audio') or ''
-    parts = audio.split(':')
-    if not parts or not parts[0]:
+    if not params:
+        return ''
+    fmt = params.get('format', '')
+    rate = (params.get('rate', '') or '').split(' ')[0]
+    if not fmt or not rate.isdigit():
         return ''
 
-    # Native DSD is reported as "dsd64:2" - a rate NAME and a channel count, not
-    # the rate:bits:channels triple used for PCM. Measured on a .dsf, where ALSA
-    # showed DSD_U32_BE at 88200 (x32 = 2822400 = DSD64).
-    if parts[0].startswith('dsd'):
-        return parts[0].upper()
+    head = fmt.split('_')[0]                       # S32, S24, FLOAT, DSD
+    if fmt.startswith('DSD'):
+        # DSD_U32_BE at 88200 carries 32 bits per frame: 88200 x 32 = DSD64.
+        carrier = ''.join(c for c in fmt.split('_')[1] if c.isdigit()) or '8'
+        multiple = int(rate) * int(carrier) / 44100
+        if multiple == int(multiple):
+            return 'DSD%d' % multiple
+        return 'DSD %g kHz' % (int(rate) / 1000)
 
-    if len(parts) < 2:
-        return ''
-    rate, bits = parts[0], parts[1]
+    khz = '%g' % (int(rate) / 1000)
+    bits = ''.join(c for c in head if c.isdigit())
+    if bits:
+        return '%s bit / %s kHz' % (bits, khz)
+    return '%s / %s kHz' % (head.lower(), khz)
+
+
+def read_renderer_meta(flag):
+    """moOde caches each renderer's metadata as JSON with plain keys, written by
+    the renderer itself: /var/local/www/{apl,spot,qbz}meta.json. Empty file means
+    the renderer is not reporting anything."""
+    path, divisor = RENDERER_META_FILES.get(flag, (None, 1))
+    if not path:
+        return {}
     try:
-        khz = '%g' % (int(rate) / 1000)
-    except ValueError:
-        return audio
-    if bits == 'f':
-        return 'float / %s kHz' % khz
-    return '%s bit / %s kHz' % (bits, khz)
+        with open(path) as fh:
+            text = fh.read().strip()
+        meta = json.loads(text) if text else {}
+    except (OSError, ValueError):
+        return {}
+    if meta.get('duration'):
+        try:
+            meta['duration'] = float(meta['duration']) / divisor
+        except (TypeError, ValueError):
+            meta['duration'] = 0
+    return meta
 
 
 # Republish the player topic at least this often even when nothing changed, so a
@@ -124,6 +145,15 @@ RENDERER_LABELS = (
     ('rbactive', 'RoonBridge'),
 )
 RENDERER_FLAGS = tuple(flag for flag, _ in RENDERER_LABELS)
+
+# Each renderer's metadata cache, and the divisor its "duration" needs. They do
+# not agree on the unit: AirPlay and Spotify report milliseconds, Qobuz seconds.
+# moOde carries the same split in playerlib.js (timeDivisor).
+RENDERER_META_FILES = {
+    'aplactive': ('/var/local/www/aplmeta.json', 1000),
+    'spotactive': ('/var/local/www/spotmeta.json', 1000),
+    'qbzactive': ('/var/local/www/qbzmeta.json', 1),
+}
 
 TRANSPORT_CMDS = ('play', 'pause', 'stop', 'toggle', 'next', 'previous', 'prev')
 
@@ -184,11 +214,12 @@ def db_read(params):
         return {}
 
 
-def alsa_card_is_open(cfg_rows):
-    """True when the output substream is open, whatever opened it.
+def read_hw_params(cfg_rows):
+    """Parsed ALSA hw_params of the output substream, or None when it is closed.
 
-    Mirrors moodeutl --hwparams: in multiroom transmitter mode the real output
-    is the ALSA Loopback, not the configured card.
+    This is the one place that knows what the DAC is actually being fed, whoever
+    opened it - MPD, AirPlay, Qobuz, Bluetooth. Mirrors moodeutl --hwparams: in
+    multiroom transmitter mode the real output is the ALSA Loopback.
     """
     if cfg_rows.get('multiroom_tx') == 'On':
         try:
@@ -196,15 +227,24 @@ def alsa_card_is_open(cfg_rows):
                 card = next(line.split(': ')[1].strip()
                             for line in fh if line.startswith('card'))
         except (OSError, StopIteration):
-            return False
+            return None
     else:
         card = cfg_rows.get('cardnum', '0')
 
     try:
         with open('/proc/asound/card%s/pcm0p/sub0/hw_params' % card) as fh:
-            return fh.read().strip() != 'closed'
+            text = fh.read().strip()
     except OSError:
-        return False
+        return None
+    if text == 'closed' or not text:
+        return None
+
+    params = {}
+    for line in text.splitlines():
+        if ':' in line:
+            key, value = line.split(':', 1)
+            params[key.strip()] = value.strip()
+    return params
 
 
 def display_power():
@@ -410,8 +450,10 @@ class Bridge:
                             'local_display', 'peppy_display', 'rxactive',
                             'audioin'])
 
-        renderer_active = any(cfg_rows.get(flag) == '1' for flag in RENDERER_FLAGS)
-        card_open = alsa_card_is_open(cfg_rows)
+        active_flag = next((f for f in RENDERER_FLAGS if cfg_rows.get(f) == '1'), None)
+        renderer_active = active_flag is not None or cfg_rows.get('rxactive') == '1'
+        hw = read_hw_params(cfg_rows)
+        card_open = hw is not None
 
         # Audio on is immediate; audio off has to survive audio_off_delay, because
         # MPD closes the ALSA device between tracks (touchmon.php does the same
@@ -461,31 +503,48 @@ class Bridge:
 
         is_radio = is_radio_stream(song, status)
         station = song.get('name', '').strip()
+
+        # A renderer holds the device and MPD is stopped: its currentsong and its
+        # state both describe the track from before. Take the metadata from the
+        # renderer's own cache, and the play state from the device being open.
+        meta = read_renderer_meta(active_flag) if active_flag else {}
+        if renderer_active:
+            state = 'play' if card_open else 'stop'
+        else:
+            state = status.get('state', 'unknown')
+
         player = {
-            'state': status.get('state', 'unknown'),
+            'state': state,
             # The knob, not MPD's own volume: with a hardware mixer MPD does not
             # carry moOde's level.
             'volume': int(cfg_rows.get('volknob') or 0),
             'mute': cfg_rows.get('volmute') == '1',
             'source': display_source(cfg_rows, is_radio),
-            'station': station,
-            # Empty rather than invented: no "Unknown artist", and no station
-            # name spilling into artist/album. A renderer blanks these instead
-            # of carrying MPD's previous track over as if it were playing.
-            'artist': '' if renderer_active else song.get('artist', '').strip(),
-            'title': '' if renderer_active else song.get('title', '').strip(),
-            'album': '' if renderer_active else song.get('album', '').strip(),
-            'quality': format_quality(status),
-            'audio': status.get('audio', ''),
-            'file': song.get('file', ''),
+            'station': '' if renderer_active else station,
+            # Empty rather than invented: one key, one value. No placeholder
+            # text and no station name spilling into artist or album. While a
+            # renderer plays, these come from its own metadata cache.
+            'artist': (meta.get('artist') or '').strip() if renderer_active
+                      else song.get('artist', '').strip(),
+            'title': (meta.get('title') or '').strip() if renderer_active
+                     else song.get('title', '').strip(),
+            'album': (meta.get('album') or '').strip() if renderer_active
+                     else song.get('album', '').strip(),
+            'quality': format_quality(hw),
+            'audio': '' if renderer_active else status.get('audio', ''),
+            # What the renderer says it received, e.g. "FLAC 16/44.1 kHz"
+            'source_format': (meta.get('sformat') or '').strip(),
+            'file': '' if renderer_active else song.get('file', ''),
+            'cover_url': (meta.get('cover_url') or '').strip(),
             # Raw extras: useful in templates, deliberately not exposed as
             # entities since they are absent often enough to blink.
             'genre': song.get('genre', ''),
             'date': song.get('date', ''),
             'bitrate': int(status.get('bitrate') or 0),
-            'is_radio': is_radio,
-            'elapsed': float(status.get('elapsed') or 0),
-            'duration': float(status.get('duration') or 0),
+            'is_radio': False if renderer_active else is_radio,
+            'elapsed': 0.0 if renderer_active else float(status.get('elapsed') or 0),
+            'duration': float(meta.get('duration') or 0) if renderer_active
+                        else float(status.get('duration') or 0),
             'renderer_active': renderer_active,
         }
 
