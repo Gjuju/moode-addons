@@ -64,6 +64,31 @@ service `active` and silent.
 
 Re-runnable; it only restarts what changed.
 
+## Uninstall
+
+```bash
+sudo ./uninstall.sh                  # the normal case
+sudo ./uninstall.sh --purge-deps     # also apt purge python3-paho-mqtt
+sudo ./uninstall.sh --keep-retained  # leave the broker alone (reinstalling soon)
+```
+
+It stops the service first, then **clears the retained topics this box
+published**, then removes the unit, the daemon and `/etc/moode-mqtt.conf` (which
+carries the broker password).
+
+That middle step is the one worth understanding. Everything here is published
+retained, which means the broker — not Home Assistant — keeps the last value
+forever. Deleting the device in the HA interface therefore does not stick: HA
+re-reads the retained discovery message on its next restart and recreates it.
+The real removal is an **empty retained payload** published over each discovery
+topic, which is what the script does (19 topics on a box with a display, fewer
+on a headless one). You can do the same by hand from HA with
+Developer tools → Actions → `mqtt.publish`, empty payload, `retain: true` — it
+is still the broker you are editing, just through HA.
+
+Delete the deployment directory too if you kept one on the box: it holds a copy
+of `moode-mqtt.conf`, password included.
+
 ## Topics
 
 Instance id is `instance` from the config. Everything is published **retained,
