@@ -98,9 +98,40 @@ on change only**.
 |---|---|
 | `moode/<id>/availability` | `online` / `offline` (MQTT LWT) |
 | `moode/<id>/audio` | `ON` / `OFF` — the ALSA output substream, any source |
-| `moode/<id>/player` | JSON: `state`, `volume`, `mute`, `artist`, `title`, `album`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` |
+| `moode/<id>/player` | JSON, see below |
 | `moode/<id>/display/app` | `webui` / `peppy` / `none` |
 | `moode/<id>/display/power` | `ON` / `OFF` |
+
+### The `player` payload
+
+| key | value |
+|---|---|
+| `state` | `play` / `pause` / `stop` |
+| `volume`, `mute` | moOde's knob level and mute flag |
+| `artist`, `title`, `album` | **exactly what MPD reports, or empty** |
+| `station` | `Name` of the stream, empty off a radio |
+| `source` | `Radio`, `Library`, or the active renderer |
+| `quality` | `24 bit / 96 kHz`, `DSD64` — readable form of `audio` |
+| `audio` | raw MPD field, `44100:24:2` |
+| `genre`, `date`, `bitrate`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` | as reported |
+
+**One key, one value.** A field carries the value MPD gives for it, or nothing.
+No placeholder text, no station name spilling into `artist` or `album`, and in
+particular **no splitting of the ICY `StreamTitle`** into artist and title: that
+field is free text, nothing guarantees it is `Artist - Title` rather than the
+reverse, a show name or an advert, and splitting it would manufacture a
+confidence the data does not carry. So on a radio you typically get a filled
+`title` and an empty `artist` — which is what the stream actually provides.
+
+`source` is the one computed value, and it is computed from system state rather
+than guessed from text: moOde's `cfg_system` renderer flags, then `is_radio`.
+It is also why the MPD text fields are **blanked while a renderer is active** —
+MPD is stopped then, and its `currentsong` still describes the track from
+before, so carrying it over would report a song that is not playing.
+
+In automations, treat an empty field as "not provided":
+`{{ states('sensor.<id>_artist') | length > 0 }}` rather than a test against
+`unknown`.
 
 `player` carries `elapsed`, which changes every cycle, so change detection
 deliberately ignores that one field: the topic is republished when anything else
@@ -124,8 +155,9 @@ reports whatever tags the stream carries, often none at all.
 Discovery is automatic: the box shows up as one device named after
 `friendly_name`. Entities, where `<id>` is your `instance` value:
 `binary_sensor.<id>_audio`, `binary_sensor.<id>_display_power`,
-`sensor.<id>_{state,title,artist,album,display_app}`, `number.<id>_volume`,
-`switch.<id>_mute`, and six buttons (play, pause, stop, toggle, next, previous).
+`sensor.<id>_{state,title,artist,album,station,source,quality,display_app}`,
+`number.<id>_volume`, `switch.<id>_mute`, and six buttons (play, pause, stop,
+toggle, next, previous).
 
 Below, an amp switched on with the music and off after a silence — one
 automation each, in the editor's YAML mode, with `<id>` and `switch.amp`

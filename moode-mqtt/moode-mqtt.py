@@ -48,6 +48,60 @@ def is_radio_stream(song, status):
     return song.get('file', '').startswith('http') and not status.get('duration')
 
 
+# Text fields are never published empty. An ICY radio stream carries only
+# StreamTitle - MPD reports no artist and no album at all for one - and a local
+# file can simply be untagged (measured: a library where two albums carry a
+# genre and the third does not). An empty string is a valid HA state, distinct
+# from unknown, so it makes automations fire on the blanks between tracks.
+
+def display_source(cfg_rows, is_radio):
+    """What is actually feeding the output, using moOde's own labels
+    (playerlib.js). This is derived from system state, not guessed from tags.
+
+    A renderer wins over MPD: while AirPlay or Spotify plays, MPD is stopped and
+    its currentsong still describes the track before that.
+    """
+    for flag, label in RENDERER_LABELS:
+        if cfg_rows.get(flag) == '1':
+            if flag == 'inpactive':
+                name = cfg_rows.get('audioin', '').strip()
+                return ('%s Input' % name) if name else 'Input'
+            return label
+    if cfg_rows.get('rxactive') == '1':
+        return 'Multiroom Receiver'
+    return 'Radio' if is_radio else 'Library'
+
+
+def format_quality(status):
+    """Human-readable output format from MPD's status 'audio' field.
+
+    That field is what actually reaches the device - resampling and CamillaDSP
+    included - not the file's own format tag. Empty when nothing is playing:
+    there is no output format to report then.
+    """
+    audio = status.get('audio') or ''
+    parts = audio.split(':')
+    if not parts or not parts[0]:
+        return ''
+
+    # Native DSD is reported as "dsd64:2" - a rate NAME and a channel count, not
+    # the rate:bits:channels triple used for PCM. Measured on a .dsf, where ALSA
+    # showed DSD_U32_BE at 88200 (x32 = 2822400 = DSD64).
+    if parts[0].startswith('dsd'):
+        return parts[0].upper()
+
+    if len(parts) < 2:
+        return ''
+    rate, bits = parts[0], parts[1]
+    try:
+        khz = '%g' % (int(rate) / 1000)
+    except ValueError:
+        return audio
+    if bits == 'f':
+        return 'float / %s kHz' % khz
+    return '%s bit / %s kHz' % (bits, khz)
+
+
 # Republish the player topic at least this often even when nothing changed, so a
 # subscriber that joined late gets a fresh elapsed without us flooding the broker
 # once a second.
@@ -58,9 +112,18 @@ PLAYER_REFRESH = 30.0
 DISPLAY_RECHECK_HEADLESS = 60.0
 
 # cfg_system flags moOde sets while a non-MPD source is playing (common.php,
-# chkRendererActive()).
-RENDERER_FLAGS = ('btactive', 'aplactive', 'spotactive', 'qbzactive',
-                  'slactive', 'paactive', 'rbactive', 'inpactive')
+# chkRendererActive()), each with the label its own WebUI shows (playerlib.js).
+RENDERER_LABELS = (
+    ('inpactive', 'Input'),
+    ('btactive', 'Bluetooth'),
+    ('aplactive', 'AirPlay'),
+    ('spotactive', 'Spotify'),
+    ('qbzactive', 'Qobuz'),
+    ('slactive', 'Squeezelite'),
+    ('paactive', 'Plexamp'),
+    ('rbactive', 'RoonBridge'),
+)
+RENDERER_FLAGS = tuple(flag for flag, _ in RENDERER_LABELS)
 
 TRANSPORT_CMDS = ('play', 'pause', 'stop', 'toggle', 'next', 'previous', 'prev')
 
@@ -344,7 +407,8 @@ class Bridge:
     def collect_and_publish(self):
         cfg_rows = db_read(list(RENDERER_FLAGS) +
                            ['volknob', 'volmute', 'cardnum', 'multiroom_tx',
-                            'local_display', 'peppy_display'])
+                            'local_display', 'peppy_display', 'rxactive',
+                            'audioin'])
 
         renderer_active = any(cfg_rows.get(flag) == '1' for flag in RENDERER_FLAGS)
         card_open = alsa_card_is_open(cfg_rows)
@@ -396,16 +460,29 @@ class Bridge:
                 return
 
         is_radio = is_radio_stream(song, status)
+        station = song.get('name', '').strip()
         player = {
             'state': status.get('state', 'unknown'),
             # The knob, not MPD's own volume: with a hardware mixer MPD does not
             # carry moOde's level.
             'volume': int(cfg_rows.get('volknob') or 0),
             'mute': cfg_rows.get('volmute') == '1',
-            'artist': song.get('artist', ''),
-            'title': song.get('title', ''),
-            'album': song.get('album', ''),
+            'source': display_source(cfg_rows, is_radio),
+            'station': station,
+            # Empty rather than invented: no "Unknown artist", and no station
+            # name spilling into artist/album. A renderer blanks these instead
+            # of carrying MPD's previous track over as if it were playing.
+            'artist': '' if renderer_active else song.get('artist', '').strip(),
+            'title': '' if renderer_active else song.get('title', '').strip(),
+            'album': '' if renderer_active else song.get('album', '').strip(),
+            'quality': format_quality(status),
+            'audio': status.get('audio', ''),
             'file': song.get('file', ''),
+            # Raw extras: useful in templates, deliberately not exposed as
+            # entities since they are absent often enough to blink.
+            'genre': song.get('genre', ''),
+            'date': song.get('date', ''),
+            'bitrate': int(status.get('bitrate') or 0),
             'is_radio': is_radio,
             'elapsed': float(status.get('elapsed') or 0),
             'duration': float(status.get('duration') or 0),
@@ -460,7 +537,7 @@ class Bridge:
             'icon': 'mdi:speaker',
         })
         announce('binary_sensor', 'display_power', {
-            'name': 'Display on',
+            'name': 'Display',
             'state_topic': self.topic('display/power'),
             'icon': 'mdi:monitor',
         })
@@ -477,7 +554,10 @@ class Bridge:
         })
         for field, label, icon in (('title', 'Title', 'mdi:music-note'),
                                    ('artist', 'Artist', 'mdi:account-music'),
-                                   ('album', 'Album', 'mdi:album')):
+                                   ('album', 'Album', 'mdi:album'),
+                                   ('source', 'Source', 'mdi:import'),
+                                   ('station', 'Station', 'mdi:radio'),
+                                   ('quality', 'Quality', 'mdi:high-definition')):
             announce('sensor', field, {
                 'name': label,
                 'state_topic': player,
