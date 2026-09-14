@@ -73,6 +73,25 @@ def display_source(cfg_rows, is_radio):
     return 'Radio' if is_radio else 'Library'
 
 
+def volume_scope(cfg_rows):
+    """What moOde's volume knob actually attenuates.
+
+    'hardware' - the card's ALSA mixer, downstream of everything, so it applies
+                 to renderers too.
+    'mpd'      - `mpc volume`, MPD only. A renderer playing is then untouched by
+                 the knob, and by our volume commands.
+    'none'     - Fixed 0dB: vol.sh exits without changing anything.
+
+    moOde denies renderers the hardware mixer and makes them attenuate in
+    software (inc/renderer.php), so with a hardware mixer there are two stages:
+    the renderer's own level, then this one. The knob only describes this one.
+    """
+    mixer = cfg_rows.get('mpdmixer', '')
+    if mixer == 'none':
+        return 'none'
+    return 'hardware' if mixer == 'hardware' else 'mpd'
+
+
 def format_quality(params, status=None):
     """Readable output format from ALSA hw_params.
 
@@ -470,7 +489,7 @@ class Bridge:
 
     def collect_and_publish(self):
         cfg_rows = db_read(list(RENDERER_FLAGS) +
-                           ['volknob', 'volmute', 'cardnum', 'multiroom_tx',
+                           ['volknob', 'volmute', 'cardnum', 'multiroom_tx', 'mpdmixer',
                             'local_display', 'peppy_display', 'rxactive',
                             'audioin'])
 
@@ -532,6 +551,7 @@ class Bridge:
         # state both describe the track from before. Take the metadata from the
         # renderer's own cache, and the play state from the device being open.
         meta = read_renderer_meta(active_flag) if active_flag else {}
+        scope = volume_scope(cfg_rows)
         if renderer_active:
             state = 'play' if card_open else 'stop'
         else:
@@ -539,9 +559,13 @@ class Bridge:
 
         player = {
             'state': state,
-            # The knob, not MPD's own volume: with a hardware mixer MPD does not
-            # carry moOde's level.
-            'volume': int(cfg_rows.get('volknob') or 0),
+            # The knob, not MPD's own volume: with a hardware mixer MPD does
+            # not carry moOde's level. Null rather than a number that controls
+            # nothing: with a software mixer the knob is MPD-only, so while a
+            # renderer plays it neither describes nor changes what is heard.
+            'volume': None if (scope == 'none' or (scope == 'mpd' and renderer_active))
+                      else int(cfg_rows.get('volknob') or 0),
+            'volume_scope': scope,
             'mute': cfg_rows.get('volmute') == '1',
             'source': display_source(cfg_rows, is_radio),
             'station': '' if renderer_active else station,

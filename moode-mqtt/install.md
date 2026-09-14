@@ -107,7 +107,8 @@ on change only**.
 | key | value |
 |---|---|
 | `state` | `play` / `pause` / `stop` |
-| `volume`, `mute` | moOde's knob level and mute flag |
+| `volume`, `mute` | moOde's knob level and mute flag; `volume` is **null** when the knob controls nothing (see below) |
+| `volume_scope` | `hardware` / `mpd` / `none` — what the knob attenuates |
 | `artist`, `title`, `album` | **exactly what the source reports, or empty** |
 | `station` | stream `Name`, empty off a radio |
 | `source` | `Radio`, `Library`, or the active renderer |
@@ -130,6 +131,28 @@ than guessed from text: moOde's `cfg_system` renderer flags, then `is_radio`.
 It is also why the MPD text fields are **blanked while a renderer is active** —
 MPD is stopped then, and its `currentsong` still describes the track from
 before, so carrying it over would report a song that is not playing.
+
+### The volume knob does not always control what you hear
+
+moOde denies renderers the hardware mixer and makes each one attenuate in
+software ([`inc/renderer.php`] sets `alsa_hardware_volume false`), so with a
+hardware mixer the signal goes through **two stages**: the renderer's own level,
+set from the Spotify or Qobuz app, then moOde's knob. The knob only ever
+describes the second one.
+
+What it reaches depends entirely on `mpdmixer`, which is what `volume_scope`
+reports:
+
+| `volume_scope` | the knob drives | while a renderer plays |
+|---|---|---|
+| `hardware` | the card's ALSA mixer, downstream of everything | applies, and the published level is exact |
+| `mpd` | `mpc volume`, MPD alone | **controls nothing audible**; `volume` is published as null |
+| `none` | nothing — Fixed 0dB, `vol.sh` exits immediately | always null |
+
+A null `volume` leaves the HA number entity unknown rather than showing a slider
+that moves without changing anything. `cmd/volume` is still accepted in that
+state — it sets MPD's level for when MPD plays again — but it will not be heard
+while the renderer holds the output.
 
 ### While a renderer plays
 
