@@ -41,8 +41,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import dbus
 import musicpd
 import paho.mqtt.client as mqtt
+
+_SYSTEM_BUS = None
 
 CONF_PATH = os.environ.get('MOODE_MQTT_CONF', '/etc/moode-mqtt.conf')
 SQLDB = '/var/local/www/db/moode-sqlite3.db'
@@ -256,6 +259,32 @@ TRANSPORT_ALIASES = {'prev': 'previous'}
 
 # pibuz (Qobuz Connect) control API. Unauthenticated by its own default, and
 # reachable by www-data - both measured, not assumed.
+DBUS_PROPS = 'org.freedesktop.DBus.Properties'
+DBUS_OBJMGR = 'org.freedesktop.DBus.ObjectManager'
+
+# Bluetooth. The phone is the source and this player the sink, so the phone
+# exposes the media player and we are the remote.
+BLUEZ = 'org.bluez'
+BLUEZ_PLAYER = 'org.bluez.MediaPlayer1'
+BLUEALSA = 'org.bluealsa'
+BLUEALSA_ROOT = '/org/bluealsa'
+BLUEALSA_PCM = 'org.bluealsa.PCM1'
+# BlueALSA packs both channels into one uint16 - high byte left, low byte right
+# - and in each byte bit 7 is mute with the level in bits 0-6. Measured: level
+# 34 on both channels reads 0x2222, and muting it reads 0xa2a2, so a mute keeps
+# the level rather than zeroing it.
+BT_MUTE_BIT = 0x80
+BT_LEVEL_MAX = 0x7F
+
+# AirPlay. shairport-sync publishes MPRIS on the SYSTEM bus, plus its own
+# interface carrying what MPRIS has no room for.
+MPRIS_NAME = 'org.mpris.MediaPlayer2.ShairportSync'
+MPRIS_PATH = '/org/mpris/MediaPlayer2'
+MPRIS_PLAYER = 'org.mpris.MediaPlayer2.Player'
+SHAIRPORT_NAME = 'org.gnome.ShairportSync'
+SHAIRPORT_PATH = '/org/gnome/ShairportSync'
+SHAIRPORT_IFACE = 'org.gnome.ShairportSync'
+
 PIBUZ_API = 'http://127.0.0.1:8182'
 # One local HTTP read per publish cycle, and only while Qobuz plays. Cheap
 # against a Rust daemon on loopback - unlike a PHP fork, which is why moOde's
@@ -459,6 +488,16 @@ class Backend:
         """
         return False
 
+    def mute_usable(self, cfg_rows):
+        """Separate from volume, because they genuinely come apart.
+
+        AirPlay has a volume and no readable mute at all: shairport-sync offers
+        `mutetoggle` with nothing to read back, and a switch that toggles blind
+        would show a state it does not know. Everything else answers the same as
+        its volume.
+        """
+        return self.volume_usable(cfg_rows)
+
     def volume_state(self):
         """(level 0-100, muted, scope) as this backend sees it, or None.
 
@@ -513,6 +552,68 @@ class MoodeBackend(Backend):
             if (current.get('muted') == 'yes') == wanted:
                 return
         moode_api('set_volume -mute')
+
+
+def dbus_bus():
+    """The system bus, opened on first use.
+
+    Lazily, because a player that never sees a renderer never needs it, and
+    because a failure here has to withdraw a control rather than kill the daemon.
+    """
+    global _SYSTEM_BUS
+    if _SYSTEM_BUS is None:
+        _SYSTEM_BUS = dbus.SystemBus()
+    return _SYSTEM_BUS
+
+
+def dbus_prop(service, path, interface, name):
+    """One property, or None if anything at all went wrong.
+
+    A renderer's D-Bus objects come and go with the device, so "not there" is an
+    ordinary answer and not worth a log line on every cycle.
+    """
+    try:
+        obj = dbus_bus().get_object(service, path)
+        return dbus.Interface(obj, DBUS_PROPS).Get(interface, name)
+    except Exception:
+        return None
+
+
+def dbus_set_prop(service, path, interface, name, value):
+    try:
+        obj = dbus_bus().get_object(service, path)
+        dbus.Interface(obj, DBUS_PROPS).Set(interface, name, value)
+        return True
+    except Exception as err:
+        log('D-Bus set %s.%s failed: %s' % (interface, name, err))
+        return False
+
+
+def dbus_call(service, path, interface, method, *args):
+    try:
+        obj = dbus_bus().get_object(service, path)
+        getattr(dbus.Interface(obj, interface), method)(*args)
+        return True
+    except Exception as err:
+        log('D-Bus %s.%s failed: %s' % (interface, method, err))
+        return False
+
+
+def dbus_find(service, interface, root='/'):
+    """First object under `service` implementing `interface`, or None.
+
+    Looked up rather than configured: the path carries the device address, so it
+    changes with every phone that connects.
+    """
+    try:
+        obj = dbus_bus().get_object(service, root)
+        managed = dbus.Interface(obj, DBUS_OBJMGR).GetManagedObjects()
+    except Exception:
+        return None
+    for path, interfaces in managed.items():
+        if interface in interfaces:
+            return str(path)
+    return None
 
 
 def pibuz_request(path, body=None, method='POST'):
@@ -626,6 +727,176 @@ class PibuzBackend(Backend):
         self.invalidate()
 
 
+class BluezBackend(Backend):
+    """Bluetooth: AVRCP for transport, BlueALSA for the mixer.
+
+    Two services, each owning what it owns. bluez carries the remote-control
+    session with the phone; BlueALSA carries the local mixer, whose level is the
+    same value bluez publishes on MediaTransport1 - measured equal on both sides
+    - plus a real mute flag bluez does not expose at all.
+
+    We are the remote here, not the player, so the phone decides what a command
+    does: `Previous` past the first seconds of a track restarts it instead of
+    going back. That is the phone's rule, and not something to correct.
+    """
+
+    flag = 'btactive'
+    label = 'Bluetooth'
+
+    VERBS = {'play': 'Play', 'pause': 'Pause', 'stop': 'Stop',
+             'next': 'Next', 'previous': 'Previous'}
+
+    def __init__(self):
+        self.player = None
+        self.pcm = None
+
+    def forget(self):
+        """Both paths carry the device address, so a disconnect invalidates them."""
+        self.player = None
+        self.pcm = None
+
+    def player_path(self):
+        if self.player is None:
+            self.player = dbus_find(BLUEZ, BLUEZ_PLAYER)
+        return self.player
+
+    def pcm_path(self):
+        if self.pcm is None:
+            self.pcm = dbus_find(BLUEALSA, BLUEALSA_PCM, BLUEALSA_ROOT)
+        return self.pcm
+
+    def reachable(self):
+        path = self.player_path()
+        if path is None:
+            return False
+        if dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Status') is None:
+            self.forget()                  # the device left, the path is stale
+            return False
+        return True
+
+    def volume_usable(self, cfg_rows):
+        return self.raw_volume() is not None
+
+    def raw_volume(self):
+        """(level 0-127, muted) exactly as BlueALSA holds it, or None.
+
+        Kept on BlueALSA's own scale so a mute or a step does not round-trip
+        through 0-100 and drift.
+        """
+        pcm = self.pcm_path()
+        raw = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Volume') if pcm else None
+        if raw is None:
+            self.pcm = None
+            return None
+        left = (int(raw) >> 8) & 0xFF
+        return left & BT_LEVEL_MAX, bool(left & BT_MUTE_BIT)
+
+    def write_volume(self, level, muted):
+        byte = (BT_MUTE_BIT if muted else 0) | max(0, min(BT_LEVEL_MAX, level))
+        # Both channels together: this bridge has one volume, not a balance.
+        return dbus_set_prop(BLUEALSA, self.pcm_path(), BLUEALSA_PCM, 'Volume',
+                             dbus.UInt16((byte << 8) | byte))
+
+    def volume_state(self):
+        raw = self.raw_volume()
+        if raw is None:
+            return None
+        level, muted = raw
+        return int(round(level * 100.0 / BT_LEVEL_MAX)), muted, 'renderer'
+
+    def transport(self, verb):
+        path = self.player_path()
+        if path is None:
+            return
+        if verb == 'toggle':
+            # AVRCP has no toggle, so ask what it is doing before deciding.
+            status = str(dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Status') or '')
+            verb = 'pause' if status == 'playing' else 'play'
+        if not dbus_call(BLUEZ, path, BLUEZ_PLAYER, self.VERBS[verb]):
+            self.forget()
+
+    def set_volume(self, level):
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        self.write_volume(int(round(max(0, min(100, level)) * BT_LEVEL_MAX / 100.0)),
+                          raw[1])
+
+    def step_volume(self, direction, amount):
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        step = int(round(amount * BT_LEVEL_MAX / 100.0))
+        self.write_volume(raw[0] + (step if direction == 'up' else -step), raw[1])
+
+    def set_mute(self, wanted):
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        level, muted = raw
+        wanted = (not muted) if wanted is None else wanted
+        if wanted != muted:
+            self.write_volume(level, wanted)
+
+
+class AirPlayBackend(Backend):
+    """AirPlay, driven over shairport-sync's MPRIS interface.
+
+    MPRIS carries all six verbs, `PlayPause` included, so nothing is composed.
+
+    Two measured traps shape this:
+
+    - `systemctl is-active shairport-sync` reads `inactive` the whole time it is
+      playing, and the unit is `disabled`: moOde runs it as a child of php-fpm.
+      Its own `Active` property is the honest sign it is there.
+    - `PlaybackStatus` does NOT follow the sender - it stayed "Playing" across a
+      pause the ALSA substream clearly registered - so it is never read here.
+      `state` keeps coming from the substream, as it already did.
+    """
+
+    flag = 'aplactive'
+    label = 'AirPlay'
+
+    VERBS = {'play': 'Play', 'pause': 'Pause', 'toggle': 'PlayPause',
+             'stop': 'Stop', 'next': 'Next', 'previous': 'Previous'}
+
+    def reachable(self):
+        return bool(dbus_prop(SHAIRPORT_NAME, SHAIRPORT_PATH,
+                              SHAIRPORT_IFACE, 'Active'))
+
+    def volume_usable(self, cfg_rows):
+        return dbus_prop(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER,
+                         'Volume') is not None
+
+    def mute_usable(self, cfg_rows):
+        # MPRIS has no mute, and shairport's own `mutetoggle` reports nothing
+        # back. A switch has to show a state; this one would be guessing.
+        return False
+
+    def volume_state(self):
+        vol = dbus_prop(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'Volume')
+        if vol is None:
+            return None
+        # MPRIS works in 0.0-1.0. Measured: the sender clamps to its own ceiling
+        # and the value trails the command, so this reports where the sender says
+        # it is - never what was asked for.
+        return int(round(float(vol) * 100)), False, 'renderer'
+
+    def transport(self, verb):
+        dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, self.VERBS[verb])
+
+    def set_volume(self, level):
+        dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
+                  dbus.Double(max(0, min(100, level)) / 100.0))
+
+    def step_volume(self, direction, amount):
+        state = self.volume_state()
+        if state is None:
+            return
+        target = state[0] + (amount if direction == 'up' else -amount)
+        self.set_volume(max(0, min(100, target)))
+
+
 # The bridge
 
 
@@ -648,13 +919,15 @@ class Bridge:
         self.status_cli = musicpd.MPDClient()
 
         # Every source the bridge can drive, keyed by the flag it serves.
-        self.backends = {b.flag: b for b in (MoodeBackend(), PibuzBackend())}
+        self.backends = {b.flag: b for b in (MoodeBackend(), PibuzBackend(),
+                                             BluezBackend(), AirPlayBackend())}
         # Whatever is playing now. The publisher thread sets it, the MQTT thread
         # reads it, so a command can land on a source that stopped less than a
         # cycle ago - true before backends existed as well.
         self.backend = self.backends[None]
         self.source_label = 'moOde'
         self.volume_ok = False
+        self.mute_ok = False
 
         client_args = {'client_id': cfg['client_id']}
         try:
@@ -786,8 +1059,8 @@ class Bridge:
         backend = self.for_command('mute command')
         if backend is None:
             return
-        if not self.volume_ok:
-            log('mute command ignored: no volume to move on %s' % backend.label)
+        if not self.mute_ok:
+            log('mute command ignored: %s has no mute to read' % backend.label)
             return
         backend.set_mute(state)
 
@@ -856,8 +1129,10 @@ class Bridge:
         self.check_for_update()
         usable = self.backend is not None and self.backend.reachable()
         self.volume_ok = usable and self.backend.volume_usable(cfg_rows)
+        self.mute_ok = usable and self.backend.mute_usable(cfg_rows)
         self.publish('controls/available', 'online' if usable else 'offline')
         self.publish('volume/available', 'online' if self.volume_ok else 'offline')
+        self.publish('mute/available', 'online' if self.mute_ok else 'offline')
 
         if cfg_rows.get('peppy_display') == '1':
             app = 'peppy'
@@ -1102,7 +1377,9 @@ class Bridge:
             'command_topic': self.topic('cmd/mute'),
             'payload_on': 'on', 'payload_off': 'off',
             'icon': 'mdi:volume-off',
-        }, extra_availability=self.topic('volume/available'))
+            # Its own gate, not the volume's: AirPlay has a level to move and no
+            # mute to read.
+        }, extra_availability=self.topic('mute/available'))
         for cmd, label, icon in (('toggle', 'Play/Pause', 'mdi:play-pause'),
                                  ('play', 'Play', 'mdi:play'),
                                  ('pause', 'Pause', 'mdi:pause'),
