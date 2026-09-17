@@ -80,8 +80,50 @@ stream. Measured on .9, 2026-09-17.
 
 ## AirPlay - shairport-sync 5.5.1
 
-Not implemented yet. Noted here because it is the one that works on a stock Pi:
-the moOde binary is built `metadata-mqtt-dbus-mpris` (verified on .179, 10.3.5).
+Not implemented yet. The one that works on a **stock Pi**: the moOde binary is
+built `metadata-mqtt-dbus-mpris` (verified on .179, 10.3.5). Measured on .9 with
+a real AirPlay 2 stream from the OwnTone bench in
+`~/Code/MoodePerso/airplay-test-sender` (`timing=PTP`, so the AirPlay 2 path,
+not the RAOP fallback), 2026-09-17.
+
+Two control surfaces, and they are alternatives, not layers:
+
+**MPRIS on the system bus** - `org.mpris.MediaPlayer2.ShairportSync`,
+`/org/mpris/MediaPlayer2`.
+
+| what | detail |
+|---|---|
+| transport | `Play` `Pause` `PlayPause` `Stop` `Next` `Previous` — all six natively, `PlayPause` **is** the toggle |
+| also | `Seek`, `SetPosition`, `SetVolume`, `OpenUri` |
+| declared capability | `CanControl` `CanGoNext` `CanGoPrevious` `CanPlay` `CanPause`, and `CanSeek` **false** on a stream — MPRIS states its own limits, which maps straight onto the backend contract |
+| metadata | `xesam:title`, `artist`, `album`, `genre`, `mpris:artUrl` — an **absolute `file://`** path, where moOde's cache keeps a relative one |
+| volume | `SetVolume` works; the sender may clamp it, and the reported value can trail the command |
+| modes | `LoopStatus`, `Shuffle`, `Rate` writable. Set aside on purpose |
+
+**shairport-sync's own MQTT client** - `enable_remote = "yes"` in the `mqtt`
+section of `/etc/shairport-sync.conf` publishes and accepts `play`, `pause`,
+`playpause`, `stop`, `nextitem`, `previtem`, `volumeup`, `volumedown`,
+`mutetoggle` under `<topic>/remote`, and can even announce itself to Home
+Assistant. **Zero code**, but a separate MQTT client with its own topics and its
+own HA device, beside this bridge rather than inside it. moOde only ever `sed`s
+individual keys in that file, so the setting survives a moOde update.
+
+Three measured behaviours that a backend has to respect:
+
+- **`systemctl is-active shairport-sync` says `inactive` while it runs.** moOde
+  starts it as a child of **php-fpm**, not through the systemd unit, and the unit
+  is `disabled`. Any reachability check based on the unit would be wrong every
+  time. Use the D-Bus name.
+- **`PlaybackStatus` does not follow the sender.** It stayed `"Playing"` through
+  a pause, a play and two `PlayPause` calls, while the ALSA substream went
+  `RUNNING` → `PREPARED` → `RUNNING`. The commands *did* reach the sender — the
+  substream proves it — but the reported state is not to be trusted. The bridge
+  already takes `state` from the substream, so this costs nothing; it would have
+  cost a lot if MPRIS had looked authoritative.
+- **the volume read back is not the volume sent.** The sender clamps to its own
+  ceiling (the bench's `max_volume = 6` gave exactly 6/11 = `0.545455` for any
+  higher request), and the property trailed the command by more than 5 s in one
+  sequence while updating within 2 s in another. Latency not characterised.
 
 ---
 
