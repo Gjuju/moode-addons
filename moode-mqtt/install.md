@@ -71,10 +71,15 @@ instance = moode            # topic prefix and HA device id - pick it once
 friendly_name = moOde       # the name shown in Home Assistant
 ```
 
-`moode-mqtt.conf` is **gitignored** — it holds the broker password and is
-deployed to `/etc/moode-mqtt.conf` as `0640 root:www-data`. Only
-`moode-mqtt.conf.sample` is committed, so a `git pull` never touches your
-credentials.
+`moode-mqtt.conf` is **gitignored** — only `moode-mqtt.conf.sample` is
+committed, so a `git pull` never touches your credentials.
+
+**Edit the copy in this directory, not the one in `/etc`.** The installer copies
+this directory's `moode-mqtt.conf` to `/etc/moode-mqtt.conf`, so changes made
+directly in `/etc` are overwritten on the next run. It lives in `/etc` because
+the service runs as `www-data` and the player's home directory is `0700`, which
+makes anything under it unreadable to the service; the installed copy is also
+`0640 root:www-data`, where the working one is world-readable.
 
 ### Deploying from another machine
 
