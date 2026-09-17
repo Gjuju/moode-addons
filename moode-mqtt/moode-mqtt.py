@@ -140,6 +140,29 @@ def format_quality(params, status=None):
     return '%s / %s kHz' % (head.lower(), khz)
 
 
+def installed_version():
+    """What install.sh deployed. Empty for an install predating the VERSION file."""
+    try:
+        with open(VERSION_PATH) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ''
+
+
+def published_version():
+    """The published VERSION of this sub-project, or None when unreachable.
+
+    None is not "up to date": a missing answer must leave the sensor as it was
+    rather than claim anything.
+    """
+    try:
+        with urllib.request.urlopen(VERSION_URL, timeout=15) as resp:
+            return resp.read().decode('utf-8', 'replace').strip()
+    except Exception as err:
+        log('update check failed: %s' % err)
+        return None
+
+
 def read_renderer_meta(flag):
     """moOde caches each renderer's metadata as JSON with plain keys, written by
     the renderer itself: /var/local/www/{apl,spot,qbz}meta.json. Empty file means
@@ -165,6 +188,13 @@ def read_renderer_meta(flag):
 # subscriber that joined late gets a fresh elapsed without us flooding the broker
 # once a second.
 PLAYER_REFRESH = 30.0
+
+# Update check: the VERSION file of this sub-project, not the repo's HEAD - the
+# repo holds other add-ons, and their commits are none of this bridge's business.
+VERSION_PATH = '/etc/moode-mqtt.version'
+VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
+               '/main/moode-mqtt/VERSION')
+UPDATE_CHECK_INTERVAL = 4 * 3600
 
 # Reading the screen state costs a sudo fork. On a headless box (no X at all,
 # the common Pi case) it will never answer, so stop asking every second.
@@ -234,6 +264,8 @@ def load_config():
         # set this to http://<ip> when it does not.
         'web_base_url': (moode.get('web_base_url', '')
                          or 'http://%s.local' % socket.gethostname()).rstrip('/'),
+        'update_check': (moode.get('update_check', 'yes') or 'yes').lower()
+                        not in ('no', 'false', '0', 'off'),
         'mpd_host': moode.get('mpd_host', 'localhost'),
         'mpd_port': int(moode.get('mpd_port', 6600)),
     }
@@ -374,6 +406,8 @@ class Bridge:
         self.audio_state = False
         self.display_power_state = 'unknown'
         self.display_power_checked_at = 0.0
+        self.version = installed_version()
+        self.update_checked_at = 0.0
         self.release = moode_release()
         self.status_cli = musicpd.MPDClient()
 
@@ -525,6 +559,7 @@ class Bridge:
         # MPD takes the output back - loud. Also withdrawn on a fixed 0dB
         # output, where vol.sh changes nothing at all.
         scope_now = volume_scope(cfg_rows)
+        self.check_for_update()
         self.publish('controls/available', 'offline' if renderer_active else 'online')
         volume_usable = scope_now != 'none' and not renderer_active
         self.publish('volume/available', 'online' if volume_usable else 'offline')
@@ -630,6 +665,27 @@ class Bridge:
             return url
         return '%s/%s' % (self.cfg['web_base_url'], url.lstrip('/'))
 
+    def check_for_update(self):
+        """Compare the installed VERSION with the published one, every 4 h.
+
+        Deliberately the sub-project's VERSION rather than the repository HEAD:
+        moode-addons holds other add-ons, and a commit to one of those is not an
+        update to this bridge.
+        """
+        if not self.cfg['update_check'] or not self.version:
+            return
+        now = time.monotonic()
+        if self.update_checked_at and now - self.update_checked_at < UPDATE_CHECK_INTERVAL:
+            return
+        self.update_checked_at = now
+
+        latest = published_version()
+        if latest is None:
+            return          # unreachable: leave the sensor as it was
+        if latest != self.version:
+            log('update available: %s installed, %s published' % (self.version, latest))
+        self.publish('update/available', 'ON' if latest != self.version else 'OFF')
+
     # Home Assistant discovery
 
     def device_block(self):
@@ -638,6 +694,7 @@ class Bridge:
             'name': self.cfg['friendly_name'],
             'manufacturer': 'moOde audio',
             'model': self.release,
+            'sw_version': self.version or 'unknown',
         }
 
     def publish_discovery(self):
@@ -674,6 +731,12 @@ class Bridge:
             'device_class': 'running',
             'icon': 'mdi:speaker',
         })
+        if self.cfg['update_check'] and self.version:
+            announce('binary_sensor', 'update', {
+                'name': 'Update available',
+                'state_topic': self.topic('update/available'),
+                'device_class': 'update',
+            })
         announce('binary_sensor', 'renderer', {
             'name': 'Renderer',
             'state_topic': player,

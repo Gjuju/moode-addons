@@ -188,6 +188,7 @@ on change only**.
 | `moode/<id>/availability` | `online` / `offline` (MQTT LWT) |
 | `moode/<id>/audio` | `ON` / `OFF` — the ALSA output substream, any source |
 | `moode/<id>/player` | JSON, see below |
+| `moode/<id>/update/available` | `ON` / `OFF` — a newer moode-mqtt has been published |
 | `moode/<id>/controls/available` | `online` / `offline` — whether the transport buttons should be used |
 | `moode/<id>/volume/available` | `online` / `offline` — whether the volume control should be used |
 | `moode/<id>/display/app` | `webui` / `peppy` / `none` |
@@ -337,7 +338,7 @@ reports whatever tags the stream carries, often none at all.
 Discovery is automatic: the box shows up as one device named after
 `friendly_name`. Entities, where `<id>` is your `instance` value:
 `binary_sensor.<id>_audio`, `binary_sensor.<id>_renderer`,
-`binary_sensor.<id>_display_power`,
+`binary_sensor.<id>_display_power`, `binary_sensor.<id>_update`,
 `sensor.<id>_{state,title,artist,album,station,source,quality,display_app}`,
 `number.<id>_volume`, `switch.<id>_mute`, and six buttons (play, pause, stop,
 toggle, next, previous).
@@ -387,6 +388,26 @@ actions:
 
 `mode: single` is right here: both automations are edge-triggered and there is
 nothing to queue if one fires while the other is still running.
+
+### Update notifications
+
+`binary_sensor.<id>_update` turns on when a newer **moode-mqtt** has been
+published. Update with the command in *Updating moOde* above; the sensor clears
+on the next check.
+
+It compares `/etc/moode-mqtt.version`, deployed by the installer, against this
+sub-project's `VERSION` file as published — **not** the repository's HEAD.
+`moode-addons` holds other add-ons, and a commit to one of those is not an
+update to this bridge.
+
+This is the only thing here that reaches outside your network: one plain GET of
+a text file, every 4 hours. Set `update_check = no` in the config to disable it,
+and the sensor is not even declared. An unreachable network leaves the sensor as
+it was rather than claiming anything, and an install predating the `VERSION`
+file simply does not check.
+
+The installed version also shows as the device's firmware version in Home
+Assistant.
 
 ### Branching on the renderer
 

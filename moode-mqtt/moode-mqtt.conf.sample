@@ -38,5 +38,11 @@ volume_step = 5
 # mDNS does not resolve from Home Assistant.
 web_base_url =
 
+# Check once every 4 h whether a newer moode-mqtt has been published, and expose
+# the answer as a Home Assistant binary sensor. This is the only thing that
+# reaches outside your network: one plain GET of a version file. Set to no to
+# disable it entirely.
+update_check = yes
+
 mpd_host = localhost
 mpd_port = 6600

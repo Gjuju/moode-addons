@@ -72,6 +72,9 @@ say "-- Files"
 deploy moode-mqtt.py      /usr/local/bin/moode-mqtt.py            0755 root:root
 deploy moode-mqtt.conf    /etc/moode-mqtt.conf                    0640 root:www-data
 deploy moode-mqtt.service /etc/systemd/system/moode-mqtt.service  0644 root:root
+# The daemon runs as www-data and cannot read the clone (the player's home is
+# 0700), so the installed version has to be readable outside it.
+deploy VERSION            /etc/moode-mqtt.version                 0644 root:root
 
 # Options added to the sample since this config was written. Nothing breaks - the
 # daemon defaults them - they would just stay invisible.
