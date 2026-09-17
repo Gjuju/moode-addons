@@ -257,7 +257,10 @@ TRANSPORT_ALIASES = {'prev': 'previous'}
 # pibuz (Qobuz Connect) control API. Unauthenticated by its own default, and
 # reachable by www-data - both measured, not assumed.
 PIBUZ_API = 'http://127.0.0.1:8182'
-PIBUZ_PING_INTERVAL = 10.0
+# One local HTTP read per publish cycle, and only while Qobuz plays. Cheap
+# against a Rust daemon on loopback - unlike a PHP fork, which is why moOde's
+# own state is still read directly.
+PIBUZ_POLL_INTERVAL = 1.0
 
 running = True
 
@@ -456,6 +459,15 @@ class Backend:
         """
         return False
 
+    def volume_state(self):
+        """(level 0-100, muted, scope) as this backend sees it, or None.
+
+        None means the bridge keeps reporting moOde's own knob. A backend that
+        moves its own volume MUST answer here, or the number in Home Assistant
+        would come from one player while the slider moved another.
+        """
+        return None
+
     def transport(self, verb):
         raise NotImplementedError
 
@@ -554,30 +566,62 @@ class PibuzBackend(Backend):
     label = 'Qobuz'
 
     def __init__(self):
-        self.up = False
-        self.checked_at = 0.0
+        self.status = None
+        self.read_at = 0.0
+
+    def poll(self):
+        """One /api/status read per publish cycle, shared by every caller.
+
+        It answers "is pibuz there" and "where is its volume" at the same time,
+        so knowing whether to offer the controls costs no extra call.
+        """
+        now = time.monotonic()
+        if now - self.read_at >= PIBUZ_POLL_INTERVAL:
+            self.read_at = now
+            self.status = pibuz_request('/api/status', method='GET')
+        return self.status
+
+    def invalidate(self):
+        """Re-read on the next cycle instead of serving a level we just moved."""
+        self.read_at = 0.0
 
     def reachable(self):
-        # Asked every publish cycle, but the answer only changes when pibuz
-        # starts or dies, so ask pibuz itself at a much slower rate.
-        now = time.monotonic()
-        if now - self.checked_at >= PIBUZ_PING_INTERVAL:
-            self.checked_at = now
-            self.up = pibuz_request('/api/ping', method='GET') is not None
-        return self.up
+        return self.poll() is not None
 
     def volume_usable(self, cfg_rows):
-        # pibuz DOES expose volume and mute (/api/playback/volume, a 0.0-1.0
-        # float). It stays off until the player payload reports pibuz's own
-        # level instead of moOde's: offering the knob while the number beside it
-        # comes from MPD would put back the slider that lies about what it moves.
-        return False
+        # pibuz has its own software volume, so moOde's mixer scope does not
+        # apply: a fixed 0dB output does not stop it.
+        return True
+
+    def volume_state(self):
+        playback = (self.poll() or {}).get('playback') or {}
+        level = playback.get('volume')
+        if level is None:
+            return None
+        # pibuz works in 0.0-1.0, Home Assistant and moOde in 0-100. The level
+        # it reports is the nominal one, so it survives a mute unchanged.
+        return int(round(level * 100)), bool(playback.get('muted')), 'renderer'
 
     def transport(self, verb):
         if pibuz_request('/api/playback/%s' % verb) is None:
-            # Withdraw the controls now rather than at the next ping.
-            self.up = False
-            self.checked_at = time.monotonic()
+            self.invalidate()
+
+    def set_volume(self, level):
+        self.volume_cmd({'volume': max(0, min(100, level)) / 100.0})
+
+    def step_volume(self, direction, amount):
+        delta = amount / 100.0
+        self.volume_cmd({'delta': delta if direction == 'up' else -delta})
+
+    def set_mute(self, wanted):
+        # pibuz takes the explicit form, so unlike moOde there is no need to
+        # read the current state before deciding.
+        self.volume_cmd({'mute': 'toggle' if wanted is None
+                         else ('on' if wanted else 'off')})
+
+    def volume_cmd(self, body):
+        pibuz_request('/api/playback/volume', body)
+        self.invalidate()
 
 
 # The bridge
@@ -851,7 +895,16 @@ class Bridge:
         # state both describe the track from before. Take the metadata from the
         # renderer's own cache, and the play state from the device being open.
         meta = read_renderer_meta(active_flag) if active_flag else {}
-        scope = volume_scope(cfg_rows)
+        # The backend driving the sound owns the level it reports. Without this
+        # the number in Home Assistant would come from MPD while the slider
+        # beside it moved a renderer.
+        vol_state = self.backend.volume_state() if self.backend else None
+        if vol_state is not None:
+            volume, muted, scope = vol_state
+        else:
+            volume = int(cfg_rows.get('volknob') or 0)
+            muted = cfg_rows.get('volmute') == '1'
+            scope = volume_scope(cfg_rows)
         if renderer_active:
             state = 'play' if card_open else 'stop'
         else:
@@ -859,13 +912,14 @@ class Bridge:
 
         player = {
             'state': state,
-            # The knob, not MPD's own volume: with a hardware mixer MPD does
-            # not carry moOde's level. Always the real value - whether the
-            # control should be *used* right now is carried by its own
-            # availability topic instead.
-            'volume': int(cfg_rows.get('volknob') or 0),
+            # moOde's knob, not MPD's own volume: with a hardware mixer MPD does
+            # not carry moOde's level. While a renderer with a backend plays,
+            # this is that renderer's level instead - see above. Always the real
+            # value; whether the control should be *used* right now is carried
+            # by its own availability topic.
+            'volume': volume,
             'volume_scope': scope,
-            'mute': cfg_rows.get('volmute') == '1',
+            'mute': muted,
             'source': display_source(cfg_rows, is_radio),
             'station': '' if renderer_active else station,
             # Empty rather than invented: one key, one value. No placeholder
