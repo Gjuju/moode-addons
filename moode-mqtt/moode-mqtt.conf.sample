@@ -34,10 +34,10 @@ volume_step = 5
 
 # Base URL of this box's web server, used to make AirPlay artwork reachable: its
 # cache stores a path relative to the web root, not an absolute URL like Spotify
-# and Qobuz do. Leave empty and it is detected - the address this box uses to
+# and Qobuz do. Left out or empty it is detected - the address this box uses to
 # reach the broker, which is the one Home Assistant will reach too, even with
 # Ethernet and Wi-Fi both up. Set it only for a reverse proxy or a special case.
-web_base_url =
+#web_base_url = http://192.168.1.x
 
 # Check once every 12 h whether a newer moode-mqtt has been published, and expose
 # the answer as a Home Assistant binary sensor. This is the only thing that
