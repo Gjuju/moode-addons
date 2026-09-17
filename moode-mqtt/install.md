@@ -12,9 +12,9 @@ to run alongside this bridge. Three things it cannot do:
 
 - **Volume.** It talks to MPD directly. moOde's level lives in `cfg_system.volknob`
   and, when `mpdmixer` is *hardware*, MPD does not carry it at all — so the WebUI
-  knob goes stale. This bridge routes every volume change through
-  `/var/www/util/vol.sh`, which owns `volknob`, `volmute` and the amixer-vs-mpc
-  choice.
+  knob goes stale. This bridge routes every volume change through moOde's own
+  REST API, which owns `volknob`, `volmute`, the amixer-vs-mpc choice and the
+  propagation to multiroom receivers.
 - **Non-MPD sources.** AirPlay, Spotify Connect, Qobuz, Bluetooth and line-in
   never touch MPD. This bridge reads the ALSA substream instead, so they count.
 - **The local display.** Not visible to MPD at all.
@@ -40,15 +40,16 @@ sudo ./install.sh
 ```
 
 The installer pulls `python3-paho-mqtt` and `python3-musicpd` from apt, installs
-the daemon and its systemd unit, then checks the three things that can silently
-be wrong: a wrong password leaves the service `active` and mute, and a failed
-`enable` leaves it working until the next reboot. Expect:
+the daemon and its systemd unit, then checks the things that can silently be
+wrong: a wrong password leaves the service `active` and mute, a failed `enable`
+leaves it working until the next reboot, and an unreachable REST API leaves it
+publishing state while accepting no command at all. Expect:
 
 ```
 [ok] service is running
 [ok] enabled at boot
 [ok] connected to the broker
-[ok] vol.sh present
+[ok] moOde REST API answers
 ```
 
 The entities appear in Home Assistant on their own, under a device named after
@@ -199,8 +200,8 @@ on change only**.
 | key | value |
 |---|---|
 | `state` | `play` / `pause` / `stop` |
-| `volume`, `mute` | moOde's knob level and mute flag |
-| `volume_scope` | `hardware` / `mpd` / `none` — what the knob attenuates |
+| `volume`, `mute` | the level and mute flag of whatever is playing — moOde's knob, or the renderer's own when the bridge can drive that renderer |
+| `volume_scope` | `hardware` / `mpd` / `none` / `renderer` — what the knob attenuates |
 | `artist`, `title`, `album` | **exactly what the source reports, or empty** |
 | `station` | stream `Name`, empty off a radio |
 | `source` | `Radio`, `Library`, or the active renderer |
@@ -235,44 +236,54 @@ describes the second one.
 What it reaches depends entirely on `mpdmixer`, which is what `volume_scope`
 reports:
 
-| `volume_scope` | the knob drives | while a renderer plays |
+| `volume_scope` | the knob drives | while another source holds the output |
 |---|---|---|
-| `hardware` | the card's ALSA mixer, downstream of everything | applies, and the published level is exact |
-| `mpd` | `mpc volume`, MPD alone | **controls nothing audible**; `volume` is published as null |
-| `none` | nothing — Fixed 0dB, `vol.sh` exits immediately | always null |
+| `hardware` | the card's ALSA mixer, downstream of everything | applies to it too, being downstream |
+| `mpd` | MPD's own mixer, nothing else | **controls nothing audible** |
+| `none` | nothing — Fixed 0dB | nothing, ever |
+| `renderer` | that renderer's own software level | it *is* what is playing |
 
-So **every control is published as unavailable while a renderer plays** — the
-six transport buttons, the volume and the mute. Each lists its gate alongside
-the bridge's own availability with `availability_mode: all`, and Home Assistant
-greys them out: nothing to read wrongly, nothing to press or drag by accident,
-no automation acting on something it does not reach.
+`volume` always carries a real number — whichever player it belongs to. It is
+never published as null or omitted: whether the control should be *used* right
+now is carried by `volume/available`, not by a hole in the payload.
 
-Two gates, because the reasons differ:
+So a control is published as unavailable **whenever the bridge cannot reach what
+is actually playing**. Each one lists its gate alongside the bridge's own
+availability with `availability_mode: all`, and Home Assistant greys it out:
+nothing to read wrongly, nothing to press or drag by accident, no automation
+acting on something it does not reach.
 
 | topic | goes offline when | gates |
 |---|---|---|
-| `controls/available` | a renderer is active | the six transport buttons |
-| `volume/available` | a renderer is active, **or** the output is a fixed 0dB | volume, mute |
+| `controls/available` | nothing can drive what is playing | the six transport buttons |
+| `volume/available` | the same, **or** there is no volume to move | volume, mute |
 
-The transport buttons talk to MPD, which is stopped during a renderer, so they
-do not reach what is playing. The volume gate adds the fixed 0dB case, where
-`vol.sh` exits without changing anything whatever is playing.
+The gate is not "a renderer is playing" but "nothing here can drive it". Those
+were the same thing until the bridge learned to drive renderers directly, and
+they still are for a renderer it has no backend for — see
+[Driving the renderer itself](#driving-the-renderer-itself).
+
+The reasons the two gates differ: transport buttons otherwise talk to MPD, which
+is *stopped* during a renderer, so they would not reach what is playing. The
+volume gate adds the cases where there is nothing to move at all — a fixed 0dB
+output, where moOde's volume command exits without changing anything.
 
 moOde does the same in its own way: its renderer indicator covers the playback
-screen entirely, so its transport controls are not reachable either. The volume
-is the one place this bridge is stricter — moOde only disables its knob for a
-fixed 0dB output, and on a hardware mixer it lets you raise the DAC during a
-renderer. That raise **stays** once MPD takes the output back, which is loud,
-and much worse when an automation does it rather than a person. The renderer's
-own level belongs to its app.
+screen entirely, so its own transport controls are not reachable either. Where
+this bridge is **stricter** is a renderer it cannot drive on a hardware mixer:
+moOde lets you raise the DAC there, and that raise **stays** once MPD takes the
+output back, which is loud — much worse when an automation does it than a
+person. Where it is **less** strict is a renderer it *can* drive, because then
+it moves that renderer's own software level, which disappears with the stream.
 
-`volume` keeps carrying the real knob value throughout, since it is a true piece
-of moOde's state; only the *control* is withdrawn.
+`volume` keeps carrying a real value throughout — moOde's knob, or the
+renderer's own — since it is always a true piece of some player's state. Only
+the *control* is withdrawn.
 
-moOde's own ceiling still applies to everything this bridge does, because all
-volume goes through `vol.sh`: set **Configure → Audio → Max volume**
-(`volume_mpd_max`) and neither the WebUI nor Home Assistant can exceed it. That
-is a moOde setting, not something this bridge duplicates.
+moOde's own ceiling applies to everything the bridge does **to moOde**, because
+that volume goes through moOde's API: set **Configure → Audio → Max volume**
+(`volume_mpd_max`) and neither the WebUI nor Home Assistant can exceed it. It
+does not apply to a renderer's own level, which moOde does not manage either.
 
 ### While a renderer plays
 
@@ -286,6 +297,10 @@ track from before. Reporting those would be plainly wrong, so:
 - `state` is taken from the ALSA device being open, not from MPD.
 - `file`, `station`, `audio` and `is_radio` are blanked — they describe MPD's
   idea of the world, which is stale at that moment.
+- `volume`, `mute` and `volume_scope` come from the renderer itself **when the
+  bridge can drive it**, so the number in Home Assistant belongs to the same
+  player the slider moves. Otherwise they stay moOde's, and the control is
+  withdrawn rather than left pointing at the wrong player.
 
 Measured on all four, with the bridge running:
 
@@ -324,6 +339,44 @@ In automations, treat an empty field as "not provided":
 deliberately ignores that one field: the topic is republished when anything else
 moves, and otherwise once every 30 s (`PLAYER_REFRESH`). Without that the broker
 would get one retained message per second forever.
+
+### Driving the renderer itself
+
+moOde offers **no way at all** to drive a renderer: `command/index.php` has no
+transport command for one, and moOde's own WebUI shows only a *disconnect*
+button while one plays. So there is nothing to bypass here — a command sent to a
+renderer goes to the only thing that can move it, its own daemon.
+
+The bridge keeps one **backend per source**, chosen from the `cfg_system` flag
+moOde raises for it. A backend implements all six transport verbs or it is not
+registered at all; volume is separate, because it genuinely varies. A source
+with no backend keeps its controls withdrawn, exactly as before.
+
+| source | transport | volume, mute | through |
+|---|---|---|---|
+| moOde's own player | yes | yes, unless fixed 0dB | moOde's REST API |
+| **Qobuz Connect** | yes | yes | pibuz's HTTP API on `127.0.0.1:8182` |
+| AirPlay, Spotify, Bluetooth, line-in, Squeezelite, Plexamp, RoonBridge | — | — | withdrawn, no backend yet |
+| multiroom receiver | — | — | withdrawn; the sound is another box's |
+
+The same six payloads on `cmd/transport` work whatever is playing. Nothing in
+Home Assistant changes: **no entity is added** for this, the existing buttons
+and slider simply stop being greyed out for a source the bridge can drive.
+
+**Qobuz / pibuz specifics.** pibuz is unauthenticated by its own default — its
+source documents `[server] token` as opt-in — so the bridge sends no credential
+and **keeps no copy of one**. If you do set a token in `qbzd.toml`, pibuz answers
+`401`, the bridge logs that plainly and the Qobuz controls stay withdrawn rather
+than failing silently. Note also that pibuz listens on `0.0.0.0`, not just
+loopback: that is its own choice, not something this bridge introduces.
+
+Volume is a `0.0`–`1.0` float there against moOde's `0`–`100`, converted by the
+backend. `mute` is sent as an explicit `on`/`off` — unlike moOde's, whose command
+is a toggle and has to be read back first.
+
+Measured on a live Qobuz Connect session: `pause`, `play`, `next` and `previous`
+all followed, `dn 5` / `up 5` moved pibuz's level and not MPD's, and the `player`
+payload reported pibuz's number throughout.
 
 | command topic | payload |
 |---|---|
@@ -415,11 +468,15 @@ Assistant.
 
 ### Branching on the renderer
 
-`binary_sensor.<id>_renderer` complements the withdrawn controls. Unavailability
-stops a person from clicking; the sensor lets an automation not even try. An
-automation that presses `Play` while Qobuz holds the output targets an
-unavailable entity: Home Assistant refuses it and logs an error — harmless, but
-noise you can avoid with a condition.
+`binary_sensor.<id>_renderer` answers a different question from availability:
+*who holds the output*, rather than *can I act on it*. The two no longer move
+together — Qobuz sets the sensor **on** while its controls stay perfectly
+usable — so pick the one that matches what the automation actually needs.
+
+Use it when the automation cares that an external source is playing: don't touch
+the queue, don't announce the next library track. An automation that presses
+`Play` on a source with no backend targets an unavailable entity, which Home
+Assistant refuses and logs — harmless, but noise a condition avoids.
 
 ```yaml
 conditions:
@@ -451,8 +508,8 @@ Assistant:
   moOde's own worker runs from `rc.local` as root there, which this service is
   independent of.
 - `/var/local/www/db/moode-sqlite3.db` is owned by `www-data` on the Pi exactly
-  as on x86, so `vol.sh` works from a `www-data` daemon. This was the one thing
-  that could have forced a different user, and it does not.
+  as on x86, so the daemon reads it as `www-data`. This was the one thing that
+  could have forced a different user, and it does not.
 - `www-data ALL=(ALL) NOPASSWD: ALL` is present on stock moOde too.
 - `python3-musicpd` is already installed; `python3-paho-mqtt` (2.1.0) comes from
   apt via `install.sh`.
@@ -466,10 +523,11 @@ forking a `sudo xset` every second for an answer that will never come.
 
 ## How much of moOde's own code is used
 
-**Every command goes through moOde's REST API**, `www/command/index.php`, never
-straight to MPD or to `vol.sh`. That endpoint is a REST API by design — its own
-source notes it handles *"CLI based REST commands sent for example by curl"* —
-and it carries internal mechanisms that are invisible from outside:
+**Every command moOde has a mechanism for goes through moOde's REST API**,
+`www/command/index.php`, never straight to MPD or to `vol.sh`. That endpoint is
+a REST API by design — its own source notes it handles *"CLI based REST commands
+sent for example by curl"* — and it carries internal mechanisms that are
+invisible from outside:
 
 | command | what moOde does that calling the tool directly would skip |
 |---|---|
@@ -480,6 +538,11 @@ and it carries internal mechanisms that are invisible from outside:
 The multiroom propagation is the one worth naming: a bridge calling `vol.sh`
 directly changes the master level and leaves the receivers where they were, with
 nothing to indicate it.
+
+The exception is a **renderer**, where moOde has no mechanism to use in the first
+place — `set_volume` refusing while one is active is moOde stating exactly that.
+Those commands go to the renderer's own daemon, which is the only thing that can
+move it. See [Driving the renderer itself](#driving-the-renderer-itself).
 
 **The state read stays direct** — `/proc` and the database, at 1 Hz. Routing it
 through PHP too would fork php-fpm every second, forever, on hardware that may
@@ -531,7 +594,8 @@ immediately.
 
 **No writes to `cfg_system`.** The database is opened read-only. Writing it
 behind moOde's back desyncs its PHP session cache, and the WebUI then looks
-stuck. Every change goes through `vol.sh` or `mpc`.
+stuck. Every change goes through moOde's REST API, or — for a renderer moOde
+cannot drive — through that renderer's own daemon.
 
 **Runs as `www-data`**, the web server user — the sqlite DB is owned by
 `www-data`, so a root daemon would leave root-owned journal files behind.
