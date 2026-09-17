@@ -194,7 +194,7 @@ PLAYER_REFRESH = 30.0
 VERSION_PATH = '/etc/moode-mqtt.version'
 VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
                '/main/moode-mqtt/VERSION')
-UPDATE_CHECK_INTERVAL = 4 * 3600
+UPDATE_CHECK_INTERVAL = 12 * 3600
 
 # Reading the screen state costs a sudo fork. On a headless box (no X at all,
 # the common Pi case) it will never answer, so stop asking every second.
@@ -666,7 +666,7 @@ class Bridge:
         return '%s/%s' % (self.cfg['web_base_url'], url.lstrip('/'))
 
     def check_for_update(self):
-        """Compare the installed VERSION with the published one, every 4 h.
+        """Compare the installed VERSION with the published one, every 12 h.
 
         Deliberately the sub-project's VERSION rather than the repository HEAD:
         moode-addons holds other add-ons, and a commit to one of those is not an

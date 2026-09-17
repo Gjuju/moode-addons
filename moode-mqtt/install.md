@@ -401,7 +401,7 @@ sub-project's `VERSION` file as published — **not** the repository's HEAD.
 update to this bridge.
 
 This is the only thing here that reaches outside your network: one plain GET of
-a text file, every 4 hours. Set `update_check = no` in the config to disable it,
+a text file, every 12 hours. Set `update_check = no` in the config to disable it,
 and the sensor is not even declared. An unreachable network leaves the sensor as
 it was rather than claiming anything, and an install predating the `VERSION`
 file simply does not check.
