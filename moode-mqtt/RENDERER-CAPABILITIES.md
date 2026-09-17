@@ -1,0 +1,94 @@
+# What each renderer offers beyond what the bridge uses
+
+A working note, filled in as each renderer gets a backend. The point is to decide
+**once, at the end** what is worth exposing - not to expose things because they
+happen to exist.
+
+Everything here is measured on a real box unless marked otherwise. "Used" means
+the bridge already does something with it today.
+
+---
+
+## Qobuz Connect - pibuz 2.4.1
+
+Control surface: an HTTP daemon on `127.0.0.1:8182`, unauthenticated by its own
+default (`[server] token` is opt-in), reachable by `www-data`. Plus an SSE event
+stream. Measured on .9, 2026-09-17.
+
+> Not in moOde 10.3.5 stock: `/usr/bin/pibuz` is absent on the Pi .179. Today this
+> backend only runs on a box tracking develop.
+
+### Used
+
+| what | where |
+|---|---|
+| play, pause, toggle, stop, next, previous | `POST /api/playback/<verb>` |
+| volume, mute | `POST /api/playback/volume` - `{volume\|delta\|mute}`, 0.0-1.0 |
+| level + muted reported back | `GET /api/status` -> `playback` |
+| is it alive | same call |
+
+### Available, not used
+
+**Transport**
+- `seek` - absolute (`{"position": s}`) or relative (`{"delta": s}`)
+- `shuffle` - on / off / toggle
+- `repeat` - off / all / one
+- stop-after-track (`stop_after_track_id` in the queue state)
+
+**Queue**
+- read the whole queue: `current_track`, `upcoming`, `history`, `current_index`,
+  `total_tracks`
+- `queue/add`, `queue/clear`, `queue/jump`
+
+**Content** - a whole Qobuz client, really
+- `search`, `browse` (`album`, `artist`), `discover`, `reco`, `radio`
+- favorites: list, add, remove
+- playlists: list, read, create, delete, update, add/remove tracks
+- `lyrics`
+
+**Metadata richer than moOde's `qbzmeta.json`**
+- `track_id`, `album_id`, `artwork_url`, `duration_secs`
+- `bit_depth`, `sample_rate`, `hires`, `streamable`, `parental_warning`
+- live `position` in seconds, `queue_len`, `buffer_progress`
+- `gapless_next_track_id`, `gapless_ready`
+- ...but **no codec name**: moOde composes `FLAC 24/192 kHz` itself, pibuz never
+  says "FLAC" anywhere (checked `/api/status`, `/api/queue`, `/api/info`).
+
+**Audio chain**
+- `device_open`, `device_present` - the renderer's own view of the ALSA device
+- `bit_perfect` mode (`DirectHardware` / `PluginFallback` / `Disabled`)
+- `sample_rate` (decoded stream) vs `output_sample_rate` (device) - the two
+  differing **is** resampling, stated rather than inferred
+
+**Diagnostics**
+- `last_errors.auth`, `.stream`, `.transport`
+- cache L1/L2: bytes, track count, budget, directory
+- `network.online`, `uptime_secs`, `version`, memory class
+- QConnect: `enabled`, `is_active`, `session_active`, `pairing`, `state`,
+  `device_name`
+
+**Push instead of polling**
+- `GET /api/events` - SSE. Would replace the 1 Hz read for this renderer, and is
+  the only push source available anywhere in the bridge, MPD's idle aside.
+
+**Unverified**
+- MPRIS on D-Bus (`org.mpris.MediaPlayer2`). pibuz's own source says it is only
+  published where a session bus exists and returns nothing gracefully on a
+  headless daemon - never observed on a bus here, so do not count on it.
+
+---
+
+## AirPlay - shairport-sync 5.5.1
+
+Not implemented yet. Noted here because it is the one that works on a stock Pi:
+the moOde binary is built `metadata-mqtt-dbus-mpris` (verified on .179, 10.3.5).
+
+---
+
+## Still to measure
+
+- Bluetooth - AVRCP via `org.bluez.MediaPlayer1`. bluez runs with paired devices
+  on .9, but none was connected, so this is n=0, not a "no".
+- Spotify - librespot has no local control interface at all. Everything goes
+  through Spotify Connect. This one is a real no.
+- Squeezelite, Plexamp, RoonBridge - never looked at.
