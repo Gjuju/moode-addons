@@ -10,10 +10,11 @@
 #
 # Design notes that matter:
 #
-# - Volume ALWAYS goes through /var/www/util/vol.sh. That script owns volknob,
-#   volmute and the choice between amixer and mpc depending on mpdmixer. Calling
-#   `mpc volume` directly leaves the WebUI knob stale whenever the mixer is
-#   hardware.
+# - Commands ALWAYS go through moOde's REST API (www/command/index.php), never
+#   straight to MPD or vol.sh. That endpoint carries moOde's internal mechanisms:
+#   set_volume propagates to multiroom receivers and refuses while a renderer is
+#   active, toggle_play_pause knows the radio rule. Bypassing it drops all of
+#   that silently.
 # - "Audio active" is read from the ALSA substream (hw_params), not from MPD, so
 #   AirPlay / Spotify / Bluetooth / line-in count too. touchmon.php uses the same
 #   source. MPD closes the device between tracks, hence AUDIO_OFF_DELAY.
@@ -32,13 +33,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 import musicpd
 import paho.mqtt.client as mqtt
 
 CONF_PATH = os.environ.get('MOODE_MQTT_CONF', '/etc/moode-mqtt.conf')
 SQLDB = '/var/local/www/db/moode-sqlite3.db'
-VOL_SH = '/var/www/util/vol.sh'
+MOODE_API = 'http://localhost/command/index.php'
 
 # How moOde decides something is a radio stream (inc/mpd.php): an http file with
 # no duration. The WebUI then shows "Radio station" as the artist and uses that
@@ -325,19 +328,35 @@ def moode_release():
 # Running commands
 
 
-def run(args):
+def moode_api(cmd):
+    """Send a command through moOde's own REST API (www/command/index.php).
+
+    Not straight to MPD or to vol.sh: that endpoint carries moOde's internal
+    mechanisms, and bypassing it drops them silently. `set_volume` propagates the
+    change to multiroom receivers and refuses while a renderer is active;
+    `toggle_play_pause` knows moOde's radio rule; anything else is relayed to
+    MPD. It is a REST API by design - its own source notes it handles "CLI based
+    REST commands sent for example by curl".
+
+    Commands are rare, so an HTTP call costs nothing. The 1 Hz state read stays
+    direct, where a PHP fork per second would not be free.
+    """
+    url = '%s?cmd=%s' % (MOODE_API, urllib.parse.quote(cmd))
     try:
-        subprocess.run(args, timeout=10, capture_output=True)
-    except (subprocess.SubprocessError, OSError) as err:
-        log('command failed %s: %s' % (args, err))
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            body = resp.read().decode('utf-8', 'replace').strip()
+    except Exception as err:
+        log('moOde API %r failed: %s' % (cmd, err))
+        return None
 
-
-def mpc(*args):
-    run(['mpc'] + list(args))
-
-
-def vol(*args):
-    run([VOL_SH] + [str(a) for a in args])
+    try:
+        data = json.loads(body) if body else {}
+    except ValueError:
+        return body
+    # moOde answers a refusal rather than an error status
+    if isinstance(data, dict) and data.get('alert'):
+        log('moOde refused %r: %s' % (cmd, data['alert']))
+    return data
 
 
 # The bridge
@@ -428,22 +447,23 @@ class Bridge:
         if parts[0] in ('up', 'dn', 'down'):
             direction = '-up' if parts[0] == 'up' else '-dn'
             amount = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else step
-            vol(direction, amount)
+            moode_api('set_volume %s %d' % (direction, amount))
         elif parts[0].isdigit():
-            vol(parts[0])
+            moode_api('set_volume %s' % parts[0])
         else:
             log('unknown volume payload: %r' % payload)
 
     def cmd_mute(self, payload):
-        """vol.sh -mute is a TOGGLE, so honour an explicit on/off request."""
+        """set_volume -mute is a TOGGLE, so honour an explicit on/off request."""
         wanted = payload.lower()
-        muted = db_read(['volmute']).get('volmute') == '1'
+        current = moode_api('get_volume') or {}
+        muted = current.get('muted') == 'yes'
 
         if wanted in ('on', 'true', '1', 'mute') and muted:
             return
         if wanted in ('off', 'false', '0', 'unmute') and not muted:
             return
-        vol('-mute')
+        moode_api('set_volume -mute')
 
     def cmd_transport(self, payload):
         cmd = payload.lower()
@@ -452,31 +472,12 @@ class Bridge:
             return
 
         if cmd == 'toggle':
-            state, is_radio = self.player_snapshot()
-            if state == 'play':
-                mpc('stop' if is_radio else 'pause')
-            else:
-                mpc('play')
+            # moOde already knows to stop a radio and pause anything else
+            moode_api('toggle_play_pause')
         elif cmd == 'prev':
-            mpc('prev')
-        elif cmd == 'previous':
-            mpc('prev')
+            moode_api('previous')
         else:
-            mpc(cmd)
-
-    def player_snapshot(self):
-        try:
-            status = self.status_cli.status()
-            song = self.status_cli.currentsong()
-        except Exception:
-            try:
-                self.mpd_connect(self.status_cli)
-                status = self.status_cli.status()
-                song = self.status_cli.currentsong()
-            except Exception as err:
-                log('MPD unreachable for toggle: %s' % err)
-                return 'unknown', False
-        return status.get('state', 'unknown'), is_radio_stream(song, status)
+            moode_api(cmd)
 
     # State collection and publishing
 

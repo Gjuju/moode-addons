@@ -434,31 +434,42 @@ which is the truth. It also backs the check off to once a minute instead of
 forking a `sudo xset` every second for an answer that will never come.
 `display/app` still reports `none`, which is accurate: no app is on screen.
 
-## Why not call moOde's own code
+## How much of moOde's own code is used
 
-moOde already implements most of this: `getAlsaHwParams()` (`inc/alsa.php`),
-`chkRendererActive()` (`inc/common.php`), the radio test in `inc/mpd.php`, and
-`audioinfo.php`, which consolidates source, metadata cache and formats exactly
-as the bridge does. Reusing it directly was ruled out for two reasons:
+**Every command goes through moOde's REST API**, `www/command/index.php`, never
+straight to MPD or to `vol.sh`. That endpoint is a REST API by design — its own
+source notes it handles *"CLI based REST commands sent for example by curl"* —
+and it carries internal mechanisms that are invisible from outside:
 
-- **No MQTT client for PHP in Debian.** `apt-cache search mqtt` returns no PHP
-  binding, so a PHP daemon — the natural way to `require` moOde's own includes,
-  as `worker.php` and `touchmon.php` do — would need a composer or PECL
-  dependency, outside the distribution.
-- **Those endpoints are pages, not an API.** `audioinfo.php` opens a PHP session
-  and returns presentation data; `engine-mpd.php` is long-polling built for the
-  browser. Calling them once a second means forking php-fpm at 1 Hz and tying
-  this bridge to moOde's front end.
+| command | what moOde does that calling the tool directly would skip |
+|---|---|
+| `set_volume` | propagates the change to **multiroom receivers** (`updReceiverVol`), and refuses outright while a renderer is active |
+| `toggle_play_pause` | applies moOde's radio rule — stop a stream, pause a file |
+| anything else | relayed to MPD, after moOde's own argument validation |
 
-So the bridge reads `/proc` and the database directly, and **duplicates a small
-amount of moOde's logic** — which is a real cost, not a free choice: the ALSA
-format designators, the radio test and the renderer flags all exist in moOde
-already. The duplicated spots carry a pointer to their original; keep them in
-step when rebasing onto a new moOde.
+The multiroom propagation is the one worth naming: a bridge calling `vol.sh`
+directly changes the master level and leaves the receivers where they were, with
+nothing to indicate it.
 
-One case makes the cost concrete: `IEC958_SUBFRAME_LE`, the S/PDIF designator,
+**The state read stays direct** — `/proc` and the database, at 1 Hz. Routing it
+through PHP too would fork php-fpm every second, forever, on hardware that may
+be a Pi. Commands are rare enough that the same cost is nothing.
+
+That split leaves **some duplicated logic** on the read side, and it is a real
+cost rather than a free choice: the ALSA format designators, the radio test and
+the renderer flags all exist in moOde already (`getAlsaHwParams()` in
+`inc/alsa.php`, `chkRendererActive()` in `inc/common.php`, the test in
+`inc/mpd.php`). The duplicated spots carry a pointer to their original; keep
+them in step when moving to a new moOde, and see *Updating moOde* above.
+
+One case makes that cost concrete: `IEC958_SUBFRAME_LE`, the S/PDIF designator,
 contains digits that are not a bit depth. moOde handles it explicitly; this
 parser first reported `958 bit / 44.1 kHz` for it.
+
+Note that a PHP daemon — the natural way to `require` moOde's includes, as
+`worker.php` and `touchmon.php` do — is not an option here: `apt-cache search
+mqtt` returns no PHP binding in Debian, so it would need a composer or PECL
+dependency from outside the distribution.
 
 ## Measured behaviour and caveats
 

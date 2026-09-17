@@ -124,12 +124,13 @@ else
 	RC=1
 fi
 
-# vol.sh is the only correct volume path; without it the bridge would desync the
-# WebUI knob on a hardware mixer.
-if [ -x /var/www/util/vol.sh ]; then
-	ok "vol.sh present"
+# Every command goes through moOde's REST API, so its absence would leave the
+# bridge publishing state while silently accepting no command at all.
+if curl -sf --max-time 5 "http://localhost/command/index.php?cmd=get_volume" >/dev/null; then
+	ok "moOde REST API answers"
 else
-	warn "/var/www/util/vol.sh missing - volume commands will do nothing"
+	warn "moOde REST API not answering - commands will do nothing"
+	warn "  check: curl 'http://localhost/command/index.php?cmd=get_volume'"
 	RC=1
 fi
 
