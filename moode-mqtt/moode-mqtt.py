@@ -598,8 +598,10 @@ class PibuzBackend(Backend):
         level = playback.get('volume')
         if level is None:
             return None
-        # pibuz works in 0.0-1.0, Home Assistant and moOde in 0-100. The level
-        # it reports is the nominal one, so it survives a mute unchanged.
+        # pibuz works in 0.0-1.0, Home Assistant and moOde in 0-100. Measured:
+        # /api/status reports the LIVE level, so it reads 0 while muted and
+        # comes back on unmute - pibuz keeps the pre-mute level to itself
+        # (nominal_volume is applied on its command routes, not here).
         return int(round(level * 100)), bool(playback.get('muted')), 'renderer'
 
     def transport(self, verb):
