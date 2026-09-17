@@ -143,17 +143,29 @@ connects.
 | what | where |
 |---|---|
 | Play, Pause, Stop, Next, Previous | `org.bluez.MediaPlayer1` on `…/dev_XX/player0` |
-| volume | `bluealsa-cli volume <pcm>` — **0-127** for A2DP, and the same value as `org.bluez.MediaTransport1.Volume`, verified equal on both sides |
-| mute | `bluealsa-cli mute <pcm>` — a real `Muted` flag, no stash-and-zero, and the nominal volume survives it |
-| state | `Status` = `playing` / `paused` / `stopped` |
-| **metadata** | `Track` — Title, Artist, Album, Genre, Duration (ms), TrackNumber, NumberOfTracks |
+| `Status` | same object — read only to compose the toggle AVRCP does not have |
+| volume and mute | `org.bluealsa.PCM1.Volume`, one uint16: high byte left, low byte right, bit 7 mute, bits 0-6 level (0-127). Measured: level 34 reads `0x2222`, muted `0xa2a2`, so a mute keeps the level |
+
+Both object paths carry the device address, so they are looked up through each
+service's `ObjectManager` and dropped when the device leaves.
+
+The same `Volume` is what bluez publishes on `MediaTransport1` — verified equal
+on both sides — so this is one control, not two.
+
+### Available, not used
+
+| what | where |
+|---|---|
+| **metadata** | `Track` — Title, Artist, Album, Genre, Duration (ms), TrackNumber |
 | position | `Position`, in ms |
-| **codec** | `bluealsa-cli info` — `aptX-HD` here, from `Selected codec` |
+| **codec** | `org.bluealsa.PCM1.Codec` — `aptX-HD` here |
+| sampling, channels, running | same interface |
 | the app playing on the phone | `Name` = `Qobuz` |
 
-Two of those close gaps this bridge documents as empty: Bluetooth is the one
+The first three close gaps this bridge documents as empty: Bluetooth is the one
 renderer moOde keeps **no metadata cache** for, so `artist` / `title` / `album`
-and `source_format` are blank today. AVRCP has all of them.
+and `source_format` are blank. AVRCP has all of them, and the backend is already
+connected to the very interfaces that carry them.
 
 Measured behaviour worth carrying into the backend:
 
