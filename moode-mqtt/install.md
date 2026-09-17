@@ -40,12 +40,13 @@ sudo ./install.sh
 ```
 
 The installer pulls `python3-paho-mqtt` and `python3-musicpd` from apt, installs
-the daemon and its systemd unit, enables it, and then checks that the broker
-connection actually came up — a wrong password otherwise leaves the service
-`active` and silent. Expect:
+the daemon and its systemd unit, then checks the three things that can silently
+be wrong: a wrong password leaves the service `active` and mute, and a failed
+`enable` leaves it working until the next reboot. Expect:
 
 ```
 [ok] service is running
+[ok] enabled at boot
 [ok] connected to the broker
 [ok] vol.sh present
 ```
@@ -106,6 +107,46 @@ rsync -a --exclude .git --exclude __pycache__ --exclude 'moode-mqtt.conf' \
 scp moode-mqtt.conf.pi moode@<box>:~/moode-mqtt/moode-mqtt.conf
 ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
 ```
+
+## Updating moOde
+
+**Nothing to reinstall.** Neither a moOde update nor a re-run of a moOde
+installer touches this add-on, which was verified rather than assumed:
+
+- the bridge shares no file with moOde — `/usr/local/bin/moode-mqtt.py`,
+  `/etc/moode-mqtt.conf`, `/etc/systemd/system/moode-mqtt.service` — and no
+  moOde installer sweeps those directories;
+- no `pkill` or `killall` in moOde can match `moode-mqtt.py`;
+- no `autoremove` runs, so `python3-paho-mqtt` and `python3-musicpd` stay;
+- the unit stays enabled, so it comes back on the reboot that follows.
+
+MPD restarts during an update and the bridge loses its connection; it reconnects
+on its own, retrying every 5 s. Nothing to do.
+
+**What to check instead.** The risk is not the bridge disappearing — it is the
+bridge surviving and reading the new moOde wrongly. It duplicates a little of
+moOde's logic (ALSA format designators, the radio test, the renderer cache
+paths, `cfg_system` column names), and if a moOde release moves one of those,
+the bridge keeps publishing, quietly wrong. So after a **major** moOde update,
+look once at what comes out rather than reinstalling:
+
+```bash
+mosquitto_sub -h <broker> -u <user> -P <pass> -t 'moode/<id>/player' -C 1
+```
+
+Play a local file and a radio station, and check `source`, `quality`, `artist`
+and `title` against what moOde's own WebUI shows. Two minutes, and it covers
+exactly what could have drifted. The duplicated spots each carry a pointer to
+their original in moOde's source — see *Why not call moOde's own code*.
+
+The one case that does need `sudo ./install.sh` again is updating **the bridge
+itself**:
+
+```bash
+cd moode-addons && git pull && cd moode-mqtt && sudo ./install.sh
+```
+
+Your `moode-mqtt.conf` is gitignored, so a pull never touches your credentials.
 
 ## Uninstall
 
