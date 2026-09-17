@@ -10,11 +10,15 @@
 #
 # Design notes that matter:
 #
-# - Commands ALWAYS go through moOde's REST API (www/command/index.php), never
-#   straight to MPD or vol.sh. That endpoint carries moOde's internal mechanisms:
-#   set_volume propagates to multiroom receivers and refuses while a renderer is
-#   active, toggle_play_pause knows the radio rule. Bypassing it drops all of
-#   that silently.
+# - Commands go through moOde's REST API (www/command/index.php) wherever moOde
+#   HAS a mechanism, never straight to MPD or vol.sh. That endpoint carries
+#   moOde's internal mechanisms: set_volume propagates to multiroom receivers and
+#   refuses while a renderer is active, toggle_play_pause knows the radio rule.
+#   Bypassing it drops all of that silently.
+#   The exception is a renderer, where moOde has no mechanism at all to bypass:
+#   command/index.php has no transport command for one, and moOde's own WebUI
+#   offers only "disconnect" while one plays (playerlib.js). A renderer backend
+#   fills that gap - it does not route around anything.
 # - "Audio active" is read from the ALSA substream (hw_params), not from MPD, so
 #   AirPlay / Spotify / Bluetooth / line-in count too. touchmon.php uses the same
 #   source. MPD closes the device between tracks, hence AUDIO_OFF_DELAY.
@@ -243,7 +247,11 @@ RENDERER_META_FILES = {
     'qbzactive': ('/var/local/www/qbzmeta.json', 1),
 }
 
-TRANSPORT_CMDS = ('play', 'pause', 'stop', 'toggle', 'next', 'previous', 'prev')
+# The verbs a backend must implement to be registered at all. Every real
+# candidate does (moOde/MPD, pibuz, shairport-sync, Bluetooth AVRCP), so
+# advertising them one by one would be machinery for a case that does not exist.
+TRANSPORT_VERBS = ('play', 'pause', 'toggle', 'stop', 'next', 'previous')
+TRANSPORT_ALIASES = {'prev': 'previous'}
 
 running = True
 
@@ -410,6 +418,73 @@ def moode_api(cmd):
     return data
 
 
+# Renderer control backends
+#
+# One backend serves one source: the cfg_system flag moOde raises while that
+# renderer plays, or None for moOde's own player. The bridge picks the backend
+# matching what is playing and routes every command to it; a source with no
+# backend gets its controls withdrawn in Home Assistant rather than a button that
+# moves something else.
+#
+# Contract: implement all six transport verbs, or do not register. Volume is
+# optional and declared, because it genuinely varies - AVRCP has no volume, and
+# even moOde's own has none on a fixed 0dB output.
+
+
+class Backend:
+    """What the bridge needs from any source it can drive."""
+
+    flag = None            # cfg_system flag this backend serves; None = moOde/MPD
+    label = 'moOde'
+    has_volume = False
+
+    def reachable(self):
+        """Is the mechanism answering right now? Checked every publish cycle."""
+        return True
+
+    def transport(self, verb):
+        raise NotImplementedError
+
+    def set_volume(self, level):
+        raise NotImplementedError
+
+    def step_volume(self, direction, amount):
+        raise NotImplementedError
+
+    def set_mute(self, wanted):
+        """wanted: True to mute, False to unmute, None to toggle."""
+        raise NotImplementedError
+
+
+class MoodeBackend(Backend):
+    """moOde's own player, driven through its REST API."""
+
+    flag = None
+    label = 'moOde'
+    has_volume = True
+
+    def transport(self, verb):
+        if verb == 'toggle':
+            # moOde already knows to stop a radio and pause anything else
+            moode_api('toggle_play_pause')
+        else:
+            moode_api(verb)
+
+    def set_volume(self, level):
+        moode_api('set_volume %d' % level)
+
+    def step_volume(self, direction, amount):
+        moode_api('set_volume %s %d' % ('-up' if direction == 'up' else '-dn', amount))
+
+    def set_mute(self, wanted):
+        """set_volume -mute is a TOGGLE, so honour an explicit on/off request."""
+        if wanted is not None:
+            current = moode_api('get_volume') or {}
+            if (current.get('muted') == 'yes') == wanted:
+                return
+        moode_api('set_volume -mute')
+
+
 # The bridge
 
 
@@ -430,6 +505,14 @@ class Bridge:
         self.update_checked_at = 0.0
         self.release = moode_release()
         self.status_cli = musicpd.MPDClient()
+
+        # Every source the bridge can drive, keyed by the flag it serves.
+        self.backends = {b.flag: b for b in (MoodeBackend(),)}
+        # Whatever is playing now. The publisher thread sets it, the MQTT thread
+        # reads it, so a command can land on a source that stopped less than a
+        # cycle ago - true before backends existed as well.
+        self.backend = self.backends[None]
+        self.source_label = 'moOde'
 
         client_args = {'client_id': cfg['client_id']}
         try:
@@ -454,6 +537,20 @@ class Bridge:
         self.web_base = ('http://%s' % ip) if ip else \
                         ('http://%s.local' % socket.gethostname())
         log('artwork base URL: %s (detected)' % self.web_base)
+
+    def backend_for(self, active_flag, renderer_active):
+        """The backend driving what is playing, or None when nothing drives it.
+
+        renderer_active is wider than active_flag: a multiroom receiver (rxactive)
+        raises no renderer flag yet still owns the output, so keying on the flag
+        alone would hand it moOde's backend and offer controls that move the wrong
+        player.
+        """
+        if not renderer_active:
+            return self.backends[None]
+        # active_flag is None for a multiroom receiver: look up nothing, or the
+        # None key would hand back moOde's own backend.
+        return self.backends.get(active_flag) if active_flag else None
 
     def topic(self, suffix):
         return '%s/%s' % (self.base, suffix)
@@ -502,47 +599,66 @@ class Bridge:
         self.wake.set()
 
     # Commands
+    #
+    # Parsing the payload is the bridge's job; acting on it is the backend's. A
+    # source with no backend is refused out loud instead of being sent to
+    # whatever else happens to listen.
+
+    def for_command(self, what):
+        backend = self.backend
+        if backend is None:
+            log('%s ignored: %s has no backend' % (what, self.source_label))
+            return None
+        return backend
 
     def cmd_volume(self, payload):
         parts = payload.split()
-        step = self.cfg['volume_step']
-
         if not parts:
             return
+
+        backend = self.for_command('volume command')
+        if backend is None:
+            return
+        if not backend.has_volume:
+            log('volume command ignored: %s exposes none' % backend.label)
+            return
+
         if parts[0] in ('up', 'dn', 'down'):
-            direction = '-up' if parts[0] == 'up' else '-dn'
-            amount = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else step
-            moode_api('set_volume %s %d' % (direction, amount))
+            amount = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() \
+                else self.cfg['volume_step']
+            backend.step_volume('up' if parts[0] == 'up' else 'dn', amount)
         elif parts[0].isdigit():
-            moode_api('set_volume %s' % parts[0])
+            backend.set_volume(int(parts[0]))
         else:
             log('unknown volume payload: %r' % payload)
 
     def cmd_mute(self, payload):
-        """set_volume -mute is a TOGGLE, so honour an explicit on/off request."""
         wanted = payload.lower()
-        current = moode_api('get_volume') or {}
-        muted = current.get('muted') == 'yes'
+        if wanted in ('on', 'true', '1', 'mute'):
+            state = True
+        elif wanted in ('off', 'false', '0', 'unmute'):
+            state = False
+        else:
+            state = None                              # anything else toggles
 
-        if wanted in ('on', 'true', '1', 'mute') and muted:
+        backend = self.for_command('mute command')
+        if backend is None:
             return
-        if wanted in ('off', 'false', '0', 'unmute') and not muted:
+        if not backend.has_volume:
+            log('mute command ignored: %s exposes no volume' % backend.label)
             return
-        moode_api('set_volume -mute')
+        backend.set_mute(state)
 
     def cmd_transport(self, payload):
-        cmd = payload.lower()
-        if cmd not in TRANSPORT_CMDS:
+        verb = payload.lower()
+        verb = TRANSPORT_ALIASES.get(verb, verb)
+        if verb not in TRANSPORT_VERBS:
             log('unknown transport payload: %r' % payload)
             return
 
-        if cmd == 'toggle':
-            # moOde already knows to stop a radio and pause anything else
-            moode_api('toggle_play_pause')
-        elif cmd == 'prev':
-            moode_api('previous')
-        else:
-            moode_api(cmd)
+        backend = self.for_command('transport %r' % verb)
+        if backend is not None:
+            backend.transport(verb)
 
     # State collection and publishing
 
@@ -579,20 +695,27 @@ class Bridge:
 
         self.publish('audio', 'ON' if self.audio_state else 'OFF')
 
-        # Withdraw the controls in Home Assistant rather than letting them move
-        # something they do not reach. moOde does the same: its renderer
-        # indicator covers the playback screen entirely.
+        # Pick the backend for whatever is playing, and let Home Assistant offer
+        # exactly what that backend can do. A source with no backend keeps its
+        # controls withdrawn rather than letting a button move something it does
+        # not reach - moOde does the same, its renderer indicator covers the
+        # playback screen entirely.
         #
-        # Transport: a renderer plays while MPD is stopped, so these reach MPD
-        # and not what is heard.
+        # Transport: a renderer plays while MPD is stopped, so moOde's own
+        # commands would reach MPD and not what is heard.
         # Volume: the renderer sets its own level from its app, and on a
         # hardware mixer raising the DAC to compensate would stay raised once
         # MPD takes the output back - loud. Also withdrawn on a fixed 0dB
-        # output, where vol.sh changes nothing at all.
+        # output, where moOde's volume changes nothing at all.
+        self.backend = self.backend_for(active_flag, renderer_active)
+        self.source_label = (dict(RENDERER_LABELS).get(active_flag, 'the renderer')
+                             if renderer_active else 'moOde')
+
         scope_now = volume_scope(cfg_rows)
         self.check_for_update()
-        self.publish('controls/available', 'offline' if renderer_active else 'online')
-        volume_usable = scope_now != 'none' and not renderer_active
+        usable = self.backend is not None and self.backend.reachable()
+        self.publish('controls/available', 'online' if usable else 'offline')
+        volume_usable = usable and self.backend.has_volume and scope_now != 'none'
         self.publish('volume/available', 'online' if volume_usable else 'offline')
 
         if cfg_rows.get('peppy_display') == '1':
