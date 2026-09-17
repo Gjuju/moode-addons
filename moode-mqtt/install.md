@@ -311,6 +311,12 @@ Measured on all four, with the bridge running:
 | Qobuz | yes | `FLAC 16/44.1 kHz` | duration in seconds |
 | Bluetooth | **no** | — | moOde keeps no cache for it; `source`, `state` and `quality` still work |
 
+Bluetooth's blanks are not a dead end: AVRCP carries artist, title, album, genre,
+duration and the codec, and it answers on a stock setup — measured, see
+[`RENDERER-CAPABILITIES.md`](RENDERER-CAPABILITIES.md). They stay empty until a
+Bluetooth backend is written, because the bridge reports what it has actually
+read, never what it could have.
+
 Three measured traps in those caches:
 
 - **the duration unit is not the same across renderers.** AirPlay and Spotify
@@ -356,8 +362,15 @@ with no backend keeps its controls withdrawn, exactly as before.
 |---|---|---|---|
 | moOde's own player | yes | yes, unless fixed 0dB | moOde's REST API |
 | **Qobuz Connect** | yes | yes | pibuz's HTTP API on `127.0.0.1:8182` |
-| AirPlay, Spotify, Bluetooth, line-in, Squeezelite, Plexamp, RoonBridge | — | — | withdrawn, no backend yet |
+| Bluetooth | not yet | not yet | AVRCP is **there and measured** — `org.bluez.MediaPlayer1` plus `bluealsa-cli` — backend not written |
+| AirPlay | not yet | not yet | shairport-sync is built with D-Bus/MPRIS **and its own MQTT client** on stock moOde |
+| Spotify | no | no | librespot exposes no local control at all; everything goes through Spotify Connect |
+| line-in, Squeezelite, Plexamp, RoonBridge | — | — | not looked at |
 | multiroom receiver | — | — | withdrawn; the sound is another box's |
+
+What each renderer's own interface offers, measured box in hand, is kept in
+[`RENDERER-CAPABILITIES.md`](RENDERER-CAPABILITIES.md) — including the parts
+this bridge deliberately does not use.
 
 The same six payloads on `cmd/transport` work whatever is playing. Nothing in
 Home Assistant changes: **no entity is added** for this, the existing buttons
