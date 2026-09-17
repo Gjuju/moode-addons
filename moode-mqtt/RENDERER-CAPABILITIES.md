@@ -80,7 +80,7 @@ stream. Measured on .9, 2026-09-17.
 
 ## AirPlay - shairport-sync 5.5.1
 
-Not implemented yet. The one that works on a **stock Pi**: the moOde binary is
+**Implemented**: transport and volume, no mute. The one that works on a **stock Pi**: the moOde binary is
 built `metadata-mqtt-dbus-mpris` (verified on .179, 10.3.5). Measured on .9 with
 a real AirPlay 2 stream from the OwnTone bench in
 `~/Code/MoodePerso/airplay-test-sender` (`timing=PTP`, so the AirPlay 2 path,
@@ -129,7 +129,7 @@ Three measured behaviours that a backend has to respect:
 
 ## Bluetooth - AVRCP
 
-Not implemented yet, but **everything needed is there**. Measured on .9 with a
+**Implemented**: transport, volume and mute. Measured on .9 with a
 Xiaomi 15T Pro connected and playing, 2026-09-17. `bluetoothd` runs with no
 `--noplugin`, so a2dp and avrcp are loaded on a stock setup.
 
@@ -137,6 +137,8 @@ The roles are worth stating: the phone is the **source**, the player is the
 **sink**, so the phone exposes the media player and the bridge acts as the
 remote. A `player0` node appears under the device on D-Bus as soon as it
 connects.
+
+### Used
 
 | what | where |
 |---|---|
@@ -167,9 +169,12 @@ Measured behaviour worth carrying into the backend:
 **n=1.** One phone, one app. AVRCP target support varies between phones, and
 what `Previous` does varies between apps.
 
-Also available, not used: `FastForward`, `Rewind`, `Hold`, `Press`, `Release`
-(raw AVRCP key events), `Browsable` / `Searchable` / `Playlist` for library
-browsing on the phone.
+### Available, not used
+
+`FastForward`, `Rewind`, `Hold`, `Press`, `Release` (raw AVRCP key events),
+`Browsable` / `Searchable` / `Playlist` for browsing the phone's library, and
+**the `Track` metadata** - the bridge reads it for nothing today, so Bluetooth's
+artist/title/album stay empty.
 
 ---
 

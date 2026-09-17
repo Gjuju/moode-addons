@@ -192,6 +192,7 @@ on change only**.
 | `moode/<id>/update/available` | `ON` / `OFF` — a newer moode-mqtt has been published |
 | `moode/<id>/controls/available` | `online` / `offline` — whether the transport buttons should be used |
 | `moode/<id>/volume/available` | `online` / `offline` — whether the volume control should be used |
+| `moode/<id>/mute/available` | `online` / `offline` — whether the mute switch should be used |
 | `moode/<id>/display/app` | `webui` / `peppy` / `none` |
 | `moode/<id>/display/power` | `ON` / `OFF` |
 
@@ -256,7 +257,13 @@ acting on something it does not reach.
 | topic | goes offline when | gates |
 |---|---|---|
 | `controls/available` | nothing can drive what is playing | the six transport buttons |
-| `volume/available` | the same, **or** there is no volume to move | volume, mute |
+| `volume/available` | the same, **or** there is no volume to move | the volume |
+| `mute/available` | the same, **or** there is no mute to read | the mute switch |
+
+Mute has its own gate because the two genuinely come apart: **AirPlay has a
+level to move and no mute at all.** MPRIS carries none, and shairport-sync's own
+`mutetoggle` reports nothing back — a switch has to show a state, and that one
+would be guessing.
 
 The gate is not "a renderer is playing" but "nothing here can drive it". Those
 were the same thing until the bridge learned to drive renderers directly, and
@@ -312,10 +319,10 @@ Measured on all four, with the bridge running:
 | Bluetooth | **no** | — | moOde keeps no cache for it; `source`, `state` and `quality` still work |
 
 Bluetooth's blanks are not a dead end: AVRCP carries artist, title, album, genre,
-duration and the codec, and it answers on a stock setup — measured, see
-[`RENDERER-CAPABILITIES.md`](RENDERER-CAPABILITIES.md). They stay empty until a
-Bluetooth backend is written, because the bridge reports what it has actually
-read, never what it could have.
+duration and the codec, and the Bluetooth backend already talks to it for the
+controls — measured, see [`RENDERER-CAPABILITIES.md`](RENDERER-CAPABILITIES.md).
+They stay empty because nothing reads them **yet**, and the bridge reports what
+it has actually read rather than what it could have.
 
 Three measured traps in those caches:
 
@@ -362,8 +369,8 @@ with no backend keeps its controls withdrawn, exactly as before.
 |---|---|---|---|
 | moOde's own player | yes | yes, unless fixed 0dB | moOde's REST API |
 | **Qobuz Connect** | yes | yes | pibuz's HTTP API on `127.0.0.1:8182` |
-| Bluetooth | not yet | not yet | AVRCP is **there and measured** — `org.bluez.MediaPlayer1` plus `bluealsa-cli` — backend not written |
-| AirPlay | not yet | not yet | shairport-sync is built with D-Bus/MPRIS **and its own MQTT client** on stock moOde |
+| **Bluetooth** | yes | yes | AVRCP (`org.bluez.MediaPlayer1`) for transport, BlueALSA for the mixer |
+| **AirPlay** | yes | volume only | shairport-sync's MPRIS on the system bus |
 | Spotify | no | no | librespot exposes no local control at all; everything goes through Spotify Connect |
 | line-in, Squeezelite, Plexamp, RoonBridge | — | — | not looked at |
 | multiroom receiver | — | — | withdrawn; the sound is another box's |
