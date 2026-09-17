@@ -873,28 +873,40 @@ class AirPlayBackend(Backend):
         # back. A switch has to show a state; this one would be guessing.
         return False
 
+    def __init__(self):
+        # The level we last asked for, which is NOT what Volume reads back: that
+        # property trails by one command, and updates on the next change rather
+        # than after any delay (measured over 20 s, twice). A relative step
+        # computed from it would be wrong, not merely late - asked to go up from
+        # a real 45 it read 25 and aimed at 35.
+        self.requested = None
+
     def volume_state(self):
         vol = dbus_prop(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'Volume')
         if vol is None:
             return None
-        # MPRIS works in 0.0-1.0. Measured: the sender clamps to its own ceiling
-        # and the value trails the command, so this reports where the sender says
-        # it is - never what was asked for.
+        # MPRIS works in 0.0-1.0. This reports where the sender says it is -
+        # never what was asked for - so it stays true even though it is late,
+        # and even though the sender may clamp to a ceiling of its own.
         return int(round(float(vol) * 100)), False, 'renderer'
 
     def transport(self, verb):
         dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, self.VERBS[verb])
 
     def set_volume(self, level):
-        dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
-                  dbus.Double(max(0, min(100, level)) / 100.0))
+        level = max(0, min(100, level))
+        if dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
+                     dbus.Double(level / 100.0)):
+            self.requested = level
 
     def step_volume(self, direction, amount):
-        state = self.volume_state()
-        if state is None:
-            return
-        target = state[0] + (amount if direction == 'up' else -amount)
-        self.set_volume(max(0, min(100, target)))
+        base = self.requested
+        if base is None:
+            state = self.volume_state()
+            if state is None:
+                return
+            base = state[0]
+        self.set_volume(base + (amount if direction == 'up' else -amount))
 
 
 # The bridge
