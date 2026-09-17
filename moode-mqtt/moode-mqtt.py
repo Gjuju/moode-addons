@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -253,6 +254,11 @@ RENDERER_META_FILES = {
 TRANSPORT_VERBS = ('play', 'pause', 'toggle', 'stop', 'next', 'previous')
 TRANSPORT_ALIASES = {'prev': 'previous'}
 
+# pibuz (Qobuz Connect) control API. Unauthenticated by its own default, and
+# reachable by www-data - both measured, not assumed.
+PIBUZ_API = 'http://127.0.0.1:8182'
+PIBUZ_PING_INTERVAL = 10.0
+
 running = True
 
 
@@ -436,11 +442,19 @@ class Backend:
 
     flag = None            # cfg_system flag this backend serves; None = moOde/MPD
     label = 'moOde'
-    has_volume = False
 
     def reachable(self):
         """Is the mechanism answering right now? Checked every publish cycle."""
         return True
+
+    def volume_usable(self, cfg_rows):
+        """Can this backend move the volume, given moOde's current config?
+
+        Each backend answers from the state it actually depends on, rather than
+        the bridge guessing on its behalf: moOde's mixer scope says nothing about
+        a renderer's own software volume.
+        """
+        return False
 
     def transport(self, verb):
         raise NotImplementedError
@@ -461,7 +475,11 @@ class MoodeBackend(Backend):
 
     flag = None
     label = 'moOde'
-    has_volume = True
+
+    def volume_usable(self, cfg_rows):
+        # A fixed 0dB output has no volume to move: moOde's own volume command
+        # changes nothing there.
+        return volume_scope(cfg_rows) != 'none'
 
     def transport(self, verb):
         if verb == 'toggle':
@@ -483,6 +501,83 @@ class MoodeBackend(Backend):
             if (current.get('muted') == 'yes') == wanted:
                 return
         moode_api('set_volume -mute')
+
+
+def pibuz_request(path, body=None, method='POST'):
+    """One call to pibuz's control API. Parsed JSON, or None if it did not work.
+
+    No Authorization header. pibuz ships with `[server] token` unset, which its
+    own source documents as an unauthenticated control plane on loopback and LAN
+    alike, and no qbzd.toml exists unless someone writes one. If a token IS set
+    the call answers 401, and that is reported as what it is: the bridge keeps no
+    copy of anyone's secret, so there is nothing here to leak or to rotate.
+    """
+    data = json.dumps(body).encode() if body is not None else b''
+    req = urllib.request.Request(PIBUZ_API + path, data=data, method=method)
+    if body is not None:
+        req.add_header('Content-Type', 'application/json')
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode('utf-8', 'replace').strip()
+    except urllib.error.HTTPError as err:
+        if err.code == 401:
+            log('pibuz refused %s: a token is set in its qbzd.toml. The bridge '
+                'holds no copy of it, so Qobuz controls stay off.' % path)
+        else:
+            log('pibuz %s failed: HTTP %s' % (path, err.code))
+        return None
+    except Exception as err:
+        log('pibuz %s failed: %s' % (path, err))
+        return None
+
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+
+
+class PibuzBackend(Backend):
+    """Qobuz Connect, driven through pibuz's own HTTP API.
+
+    Nothing is being routed around here: moOde has no command for this renderer,
+    and its WebUI offers only "disconnect" while one plays. pibuz is the only
+    thing that can move it.
+
+    Its six transport routes carry exactly our verb names, so no translation
+    table earns its keep. pibuz is started by moOde on demand and is simply
+    absent the rest of the time, so "not answering" is a normal state, not a
+    fault: the controls are withdrawn and that is all.
+    """
+
+    flag = 'qbzactive'
+    label = 'Qobuz'
+
+    def __init__(self):
+        self.up = False
+        self.checked_at = 0.0
+
+    def reachable(self):
+        # Asked every publish cycle, but the answer only changes when pibuz
+        # starts or dies, so ask pibuz itself at a much slower rate.
+        now = time.monotonic()
+        if now - self.checked_at >= PIBUZ_PING_INTERVAL:
+            self.checked_at = now
+            self.up = pibuz_request('/api/ping', method='GET') is not None
+        return self.up
+
+    def volume_usable(self, cfg_rows):
+        # pibuz DOES expose volume and mute (/api/playback/volume, a 0.0-1.0
+        # float). It stays off until the player payload reports pibuz's own
+        # level instead of moOde's: offering the knob while the number beside it
+        # comes from MPD would put back the slider that lies about what it moves.
+        return False
+
+    def transport(self, verb):
+        if pibuz_request('/api/playback/%s' % verb) is None:
+            # Withdraw the controls now rather than at the next ping.
+            self.up = False
+            self.checked_at = time.monotonic()
 
 
 # The bridge
@@ -507,12 +602,13 @@ class Bridge:
         self.status_cli = musicpd.MPDClient()
 
         # Every source the bridge can drive, keyed by the flag it serves.
-        self.backends = {b.flag: b for b in (MoodeBackend(),)}
+        self.backends = {b.flag: b for b in (MoodeBackend(), PibuzBackend())}
         # Whatever is playing now. The publisher thread sets it, the MQTT thread
         # reads it, so a command can land on a source that stopped less than a
         # cycle ago - true before backends existed as well.
         self.backend = self.backends[None]
         self.source_label = 'moOde'
+        self.volume_ok = False
 
         client_args = {'client_id': cfg['client_id']}
         try:
@@ -619,8 +715,8 @@ class Bridge:
         backend = self.for_command('volume command')
         if backend is None:
             return
-        if not backend.has_volume:
-            log('volume command ignored: %s exposes none' % backend.label)
+        if not self.volume_ok:
+            log('volume command ignored: no volume to move on %s' % backend.label)
             return
 
         if parts[0] in ('up', 'dn', 'down'):
@@ -644,8 +740,8 @@ class Bridge:
         backend = self.for_command('mute command')
         if backend is None:
             return
-        if not backend.has_volume:
-            log('mute command ignored: %s exposes no volume' % backend.label)
+        if not self.volume_ok:
+            log('mute command ignored: no volume to move on %s' % backend.label)
             return
         backend.set_mute(state)
 
@@ -711,12 +807,11 @@ class Bridge:
         self.source_label = (dict(RENDERER_LABELS).get(active_flag, 'the renderer')
                              if renderer_active else 'moOde')
 
-        scope_now = volume_scope(cfg_rows)
         self.check_for_update()
         usable = self.backend is not None and self.backend.reachable()
+        self.volume_ok = usable and self.backend.volume_usable(cfg_rows)
         self.publish('controls/available', 'online' if usable else 'offline')
-        volume_usable = usable and self.backend.has_volume and scope_now != 'none'
-        self.publish('volume/available', 'online' if volume_usable else 'offline')
+        self.publish('volume/available', 'online' if self.volume_ok else 'offline')
 
         if cfg_rows.get('peppy_display') == '1':
             app = 'peppy'
