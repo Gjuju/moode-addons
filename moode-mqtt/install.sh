@@ -76,13 +76,6 @@ deploy moode-mqtt.service /etc/systemd/system/moode-mqtt.service  0644 root:root
 # 0700), so the installed version has to be readable outside it.
 deploy VERSION            /etc/moode-mqtt.version                 0644 root:root
 
-# Options added to the sample since this config was written. Nothing breaks - the
-# daemon defaults them - they would just stay invisible.
-NEW_KEYS=$(comm -23 \
-	<(grep -oE '^[a-z_]+' "$SRC_DIR/moode-mqtt.conf.sample" | sort -u) \
-	<(grep -oE '^[a-z_]+' "$SRC_DIR/moode-mqtt.conf" | sort -u) | tr '\n' ' ')
-[ -n "$NEW_KEYS" ] && say "     new options in moode-mqtt.conf.sample:$NEW_KEYS"
-
 say
 say "-- Service"
 [ "$CHANGED_UNIT" = 1 ] && systemctl daemon-reload
