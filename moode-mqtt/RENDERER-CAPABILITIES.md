@@ -85,10 +85,54 @@ the moOde binary is built `metadata-mqtt-dbus-mpris` (verified on .179, 10.3.5).
 
 ---
 
+## Bluetooth - AVRCP
+
+Not implemented yet, but **everything needed is there**. Measured on .9 with a
+Xiaomi 15T Pro connected and playing, 2026-09-17. `bluetoothd` runs with no
+`--noplugin`, so a2dp and avrcp are loaded on a stock setup.
+
+The roles are worth stating: the phone is the **source**, the player is the
+**sink**, so the phone exposes the media player and the bridge acts as the
+remote. A `player0` node appears under the device on D-Bus as soon as it
+connects.
+
+| what | where |
+|---|---|
+| Play, Pause, Stop, Next, Previous | `org.bluez.MediaPlayer1` on `…/dev_XX/player0` |
+| volume | `bluealsa-cli volume <pcm>` — **0-127** for A2DP, and the same value as `org.bluez.MediaTransport1.Volume`, verified equal on both sides |
+| mute | `bluealsa-cli mute <pcm>` — a real `Muted` flag, no stash-and-zero, and the nominal volume survives it |
+| state | `Status` = `playing` / `paused` / `stopped` |
+| **metadata** | `Track` — Title, Artist, Album, Genre, Duration (ms), TrackNumber, NumberOfTracks |
+| position | `Position`, in ms |
+| **codec** | `bluealsa-cli info` — `aptX-HD` here, from `Selected codec` |
+| the app playing on the phone | `Name` = `Qobuz` |
+
+Two of those close gaps this bridge documents as empty: Bluetooth is the one
+renderer moOde keeps **no metadata cache** for, so `artist` / `title` / `album`
+and `source_format` are blank today. AVRCP has all of them.
+
+Measured behaviour worth carrying into the backend:
+
+- **there is no Toggle**, so it has to be composed from `Status` - the six-verb
+  contract still holds, it is just one line.
+- **`Previous` follows the player's own rule**, not ours: sent ~3.5 s into a
+  track it restarted that track rather than going back. The call succeeded; the
+  phone decided. Nothing to fix, but do not promise "previous track".
+- every property is `emits-change`, so `PropertiesChanged` would give **push**
+  instead of polling - the second push source available anywhere in the bridge.
+- `Repeat`, `Shuffle`, `Scan`, `Equalizer` are writable. Set aside on purpose.
+
+**n=1.** One phone, one app. AVRCP target support varies between phones, and
+what `Previous` does varies between apps.
+
+Also available, not used: `FastForward`, `Rewind`, `Hold`, `Press`, `Release`
+(raw AVRCP key events), `Browsable` / `Searchable` / `Playlist` for library
+browsing on the phone.
+
+---
+
 ## Still to measure
 
-- Bluetooth - AVRCP via `org.bluez.MediaPlayer1`. bluez runs with paired devices
-  on .9, but none was connected, so this is n=0, not a "no".
 - Spotify - librespot has no local control interface at all. Everything goes
   through Spotify Connect. This one is a real no.
 - Squeezelite, Plexamp, RoonBridge - never looked at.
