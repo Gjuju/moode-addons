@@ -306,8 +306,12 @@ Three measured traps in those caches:
   truncates the cache to zero — so there is no risk of reading yesterday's track.
 - **AirPlay's `cover_url` is a path, not a URL** (`imagesw/airplay-covers/…`),
   where Spotify and Qobuz give absolute `https://` links. The bridge prefixes it
-  with `web_base_url`, which defaults to `http://<hostname>.local` — set it to
-  `http://<ip>` in the config when mDNS does not resolve from Home Assistant.
+  with `web_base_url`, which is **detected** when left empty: the source address
+  that reaches the broker, asked of the routing table rather than guessed from
+  the interface list, so a player with both Ethernet and Wi-Fi up gives the
+  address traffic actually leaves by. It is resolved again on every broker
+  connection, so a changed network is followed. Set the option only for a
+  reverse proxy or a similar special case.
 
 `quality` is read from ALSA `hw_params` rather than from MPD, precisely so it
 keeps working here: it is what the DAC is actually fed, whoever opened it.

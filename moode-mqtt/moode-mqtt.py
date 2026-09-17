@@ -140,6 +140,26 @@ def format_quality(params, status=None):
     return '%s / %s kHz' % (head.lower(), khz)
 
 
+def local_address(host, port):
+    """This box's address as seen from the broker.
+
+    Asking the routing table which source address reaches the broker beats
+    listing interfaces: a player can have both Ethernet and Wi-Fi up with
+    different addresses, and the one that reaches the broker is the one Home
+    Assistant will reach too. No packet is sent - connect() on a UDP socket only
+    fixes the route.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((host, port))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except OSError:
+        return ''
+
+
 def installed_version():
     """What install.sh deployed. Empty for an install predating the VERSION file."""
     try:
@@ -260,10 +280,9 @@ def load_config():
         'volume_step': int(moode.get('volume_step', 5)),
         # AirPlay artwork is cached as a path relative to moOde's web root, unlike
         # the absolute URLs Spotify and Qobuz hand over, so it needs a base to be
-        # reachable from Home Assistant. The hostname works when mDNS resolves;
-        # set this to http://<ip> when it does not.
-        'web_base_url': (moode.get('web_base_url', '')
-                         or 'http://%s.local' % socket.gethostname()).rstrip('/'),
+        # reachable from Home Assistant. Left empty it is detected; set it for a
+        # reverse proxy or any other special case.
+        'web_base_url': (moode.get('web_base_url', '') or '').rstrip('/'),
         'update_check': (moode.get('update_check', 'yes') or 'yes').lower()
                         not in ('no', 'false', '0', 'off'),
         'mpd_host': moode.get('mpd_host', 'localhost'),
@@ -407,6 +426,7 @@ class Bridge:
         self.display_power_state = 'unknown'
         self.display_power_checked_at = 0.0
         self.version = installed_version()
+        self.web_base = cfg['web_base_url']
         self.update_checked_at = 0.0
         self.release = moode_release()
         self.status_cli = musicpd.MPDClient()
@@ -424,6 +444,16 @@ class Bridge:
         self.client.will_set(self.topic('availability'), 'offline', retain=True)
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
+
+    def resolve_web_base(self):
+        """Configured value wins; otherwise detect, falling back to mDNS."""
+        if self.cfg['web_base_url']:
+            self.web_base = self.cfg['web_base_url']
+            return
+        ip = local_address(self.cfg['host'], self.cfg['port'])
+        self.web_base = ('http://%s' % ip) if ip else \
+                        ('http://%s.local' % socket.gethostname())
+        log('artwork base URL: %s (detected)' % self.web_base)
 
     def topic(self, suffix):
         return '%s/%s' % (self.base, suffix)
@@ -445,6 +475,7 @@ class Bridge:
             return
         log('MQTT connected to %s:%s' % (self.cfg['host'], self.cfg['port']))
         client.publish(self.topic('availability'), 'online', retain=True)
+        self.resolve_web_base()
         for sub in ('cmd/volume', 'cmd/mute', 'cmd/transport'):
             client.subscribe(self.topic(sub))
         self.publish_discovery()
@@ -663,7 +694,7 @@ class Bridge:
         url = url.strip()
         if not url or url.startswith(('http://', 'https://')):
             return url
-        return '%s/%s' % (self.cfg['web_base_url'], url.lstrip('/'))
+        return '%s/%s' % (self.web_base, url.lstrip('/'))
 
     def check_for_update(self):
         """Compare the installed VERSION with the published one, every 12 h.
