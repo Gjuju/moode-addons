@@ -207,7 +207,8 @@ on change only**.
 | `station` | stream `Name`, empty off a radio |
 | `source` | `Radio`, `Library`, or the active renderer |
 | `quality` | `24 bit / 96 kHz`, `DSD64` — from ALSA, so every source |
-| `source_format` | what a renderer received: `Vorbis 320 kbps`, `FLAC 16/44.1 kHz` |
+| `source_format` | what a renderer received: `Vorbis 320 kbps`, `FLAC 16/44.1 kHz`, `aptX-HD` |
+| `decoded_format` | what came out of its decoder: `PCM 24/48 kHz, 2ch` — see *Three formats* |
 | `cover_url` | renderer artwork URL, empty otherwise |
 | `audio` | raw MPD field `44100:24:2`, empty while a renderer plays |
 | `genre`, `date`, `bitrate`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` | as reported |
@@ -316,21 +317,33 @@ Measured on all four, with the bridge running:
 | AirPlay | yes | `ALAC 16/44.1 kHz 2ch` | artwork path is **relative** |
 | Spotify | yes | `Vorbis 320 kbps` | duration in ms |
 | Qobuz | yes | `FLAC 16/44.1 kHz` | duration in seconds |
-| Bluetooth | yes | `aptX-HD 48 kHz 2ch` | not from a cache — moOde keeps none — but straight from AVRCP |
+| Bluetooth | yes | `aptX-HD` | not from a cache — moOde keeps none — but straight from AVRCP |
 
 Bluetooth is the exception to the sentence above: moOde caches nothing for it, so
 its metadata comes from the phone over AVRCP, on the same object the transport
-controls use. That covers artist, title, album, genre and duration, and BlueALSA
-names the codec. Two things it does **not** carry, left empty rather than
-borrowed:
+controls use. That covers artist, title, album, genre and duration; BlueALSA
+names the codec and gives the decoded depth and rate.
 
-- **no artwork.** AVRCP has none, so `cover_url` stays empty.
-- **no bit depth.** `source_format` is composed from the codec, the sampling rate
-  and the channel count — all three read from BlueALSA — and stops there.
+The one thing it does not carry is **artwork** — AVRCP has none at all, so
+`cover_url` stays empty rather than borrowing one.
 
 What the phone reports is the phone's business: a track with no `Genre` key
 leaves `genre` empty, and an app that calls a stream 60 seconds long puts 60 in
 `duration`. Both measured. The bridge passes on what it was told.
+
+### Three formats, not one
+
+moOde's Audio Information separates them, and so does the payload. They differ on
+every lossy source, and confusing them is easy:
+
+| moOde's label | payload key | Bluetooth example |
+|---|---|---|
+| Source format | `source_format` | `aptX-HD` — a lossy codec has no bit depth of its own |
+| Decoded to | `decoded_format` | `PCM 24/48 kHz, 2ch` — what came out of the decoder |
+| Output format | `quality` | `32 bit / 48 kHz` — what the DAC is fed, largely its own doing |
+
+`quality` is the one read from ALSA, so it works for every source including MPD.
+The other two are what the renderer says, and are empty off a renderer.
 
 Three measured traps in those caches:
 

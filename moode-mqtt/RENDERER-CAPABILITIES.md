@@ -146,7 +146,8 @@ connects.
 | `Status` | same object — read only to compose the toggle AVRCP does not have |
 | volume and mute | `org.bluealsa.PCM1.Volume`, one uint16: high byte left, low byte right, bit 7 mute, bits 0-6 level (0-127). Measured: level 34 reads `0x2222`, muted `0xa2a2`, so a mute keeps the level |
 | metadata | `Track` — Title, Artist, Album, Genre, Duration (ms) |
-| source format | `org.bluealsa.PCM1` `Codec` + `Sampling` + `Channels`, composed — no bit depth is reported in a form worth decoding |
+| source format | `org.bluealsa.PCM1.Codec` — the codec alone, as moOde shows it |
+| decoded format | `org.bluealsa.PCM1` `Format` + `Sampling` + `Channels`. `Format` is the numeric form of the name `bluealsa-cli` prints: `S24_LE` reads `0x8418`, low byte `0x18` = 24 |
 
 Both object paths carry the device address, so they are looked up through each
 service's `ObjectManager` and dropped when the device leaves.
