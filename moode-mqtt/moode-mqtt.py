@@ -973,25 +973,23 @@ class AirPlayBackend(DBusBackend):
         # volume belongs to the sender, and this was measured against one sender
         # only (the OwnTone bench, for want of an Apple device).
         self.requested = None
-        self.reported_at_request = None
 
     def volume_state(self):
         vol = self.player_props().get('Volume')
         if vol is None:
             return None
-        if self.requested is not None:
-            stale = (self.reported_at_request is not None
-                     and abs(float(vol) - self.reported_at_request) < 0.001)
-            if stale:
-                # Still the pre-command value: report what was asked instead of
-                # a number known to be out of date.
-                return self.requested, False, 'renderer'
-            # It moved, so it is current again - and it wins over what we asked,
-            # since the sender may have clamped it.
-            self.requested = None
-            self.reported_at_request = None
         # MPRIS works in 0.0-1.0.
-        return int(round(float(vol) * 100)), False, 'renderer'
+        level = int(round(float(vol) * 100))
+        if self.requested is not None:
+            if level != self.requested:
+                # The property has not caught up yet. Report what was asked for:
+                # the command applies at once, it is only the feedback that is a
+                # step behind, so this number is the true one meanwhile.
+                return self.requested, False, 'renderer'
+            # Caught up. Hand the property back the job - it, not us, knows what
+            # the sender finally did.
+            self.requested = None
+        return level, False, 'renderer'
 
     def transport(self, verb):
         self.invalidate()
@@ -999,13 +997,10 @@ class AirPlayBackend(DBusBackend):
 
     def set_volume(self, level):
         level = max(0, min(100, level))
-        self.invalidate()
-        current = self.player_props().get('Volume')
         if dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
                      dbus.Double(level / 100.0)):
             self.requested = level
-            self.reported_at_request = (float(current) if current is not None
-                                        else None)
+            self.invalidate()
 
     def step_volume(self, direction, amount):
         base = self.requested
