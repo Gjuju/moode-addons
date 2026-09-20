@@ -577,16 +577,26 @@ Assistant:
 - `/var/local/www/db/moode-sqlite3.db` is owned by `www-data` on the Pi exactly
   as on x86, so the daemon reads it as `www-data`. This was the one thing that
   could have forced a different user, and it does not.
-- `www-data ALL=(ALL) NOPASSWD: ALL` is present on stock moOde too.
+- `www-data` reaches the X server without `sudo`: moOde runs Xorg as root with
+  no auth file, so a plain `xset q` answers. Verified on that Pi as well as on
+  x86 — and it matters, because on a Pi 3 the same call through `sudo` costs
+  **51 ms of CPU** against 6.3 plain.
 - `python3-musicpd` and `python3-dbus` are already installed; `python3-paho-mqtt` (2.1.0) comes from
   apt via `install.sh`.
 
-**Headless boxes**: that Pi had no local display (`localdisplay` disabled, no
-Xorg). `xset q` then answers nothing, and the bridge publishes **nothing** on
-`display/power` rather than a made-up `OFF` — the HA entity stays `unknown`,
-which is the truth. It also backs the check off to once a minute instead of
-forking a `sudo xset` every second for an answer that will never come.
-`display/app` still reports `none`, which is accurate: no app is on screen.
+**Headless boxes**: with no Xorg running, `xset q` answers nothing and the
+bridge publishes **nothing** on `display/power` rather than a made-up `OFF` —
+the HA entity stays `unknown`, which is the truth. `display/app` still reports
+`none`, which is accurate: no app is on screen. Verified on two boxes with no X
+at all.
+
+**Why the screen state is on a timer.** Asking X costs a fork, and that made it
+by far the most expensive thing the bridge did — 6.3 ms of CPU on a Pi 3 against
+under 4 ms for everything else in a cycle put together. It is read every 10 s
+rather than every cycle, which is still quicker than moOde's own worker asks the
+same question, and the sensor it feeds is informational: the amp signal is
+`audio`, which keeps the poll interval. See
+[Do not drive the amp from the display state](#measured-behaviour-and-caveats).
 
 ## How much of moOde's own code is used
 
@@ -669,4 +679,6 @@ cannot drive — through that renderer's own daemon.
 
 **Runs as `www-data`**, the web server user — the sqlite DB is owned by
 `www-data`, so a root daemon would leave root-owned journal files behind.
-`www-data` has NOPASSWD sudo in moOde, which is what reading `xset q` needs.
+`www-data` has NOPASSWD sudo in moOde, but the bridge does not rely on it:
+reading `xset q` needs no privilege, since Xorg runs with no auth file. `sudo`
+is kept only as a fallback for a setup that would refuse the plain call.
