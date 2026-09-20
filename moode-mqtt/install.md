@@ -316,13 +316,21 @@ Measured on all four, with the bridge running:
 | AirPlay | yes | `ALAC 16/44.1 kHz 2ch` | artwork path is **relative** |
 | Spotify | yes | `Vorbis 320 kbps` | duration in ms |
 | Qobuz | yes | `FLAC 16/44.1 kHz` | duration in seconds |
-| Bluetooth | **no** | — | moOde keeps no cache for it; `source`, `state` and `quality` still work |
+| Bluetooth | yes | `aptX-HD 48 kHz 2ch` | not from a cache — moOde keeps none — but straight from AVRCP |
 
-Bluetooth's blanks are not a dead end: AVRCP carries artist, title, album, genre,
-duration and the codec, and the Bluetooth backend already talks to it for the
-controls — measured, see [`RENDERER-CAPABILITIES.md`](RENDERER-CAPABILITIES.md).
-They stay empty because nothing reads them **yet**, and the bridge reports what
-it has actually read rather than what it could have.
+Bluetooth is the exception to the sentence above: moOde caches nothing for it, so
+its metadata comes from the phone over AVRCP, on the same object the transport
+controls use. That covers artist, title, album, genre and duration, and BlueALSA
+names the codec. Two things it does **not** carry, left empty rather than
+borrowed:
+
+- **no artwork.** AVRCP has none, so `cover_url` stays empty.
+- **no bit depth.** `source_format` is composed from the codec, the sampling rate
+  and the channel count — all three read from BlueALSA — and stops there.
+
+What the phone reports is the phone's business: a track with no `Genre` key
+leaves `genre` empty, and an app that calls a stream 60 seconds long puts 60 in
+`duration`. Both measured. The bridge passes on what it was told.
 
 Three measured traps in those caches:
 

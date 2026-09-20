@@ -129,7 +129,7 @@ Three measured behaviours that a backend has to respect:
 
 ## Bluetooth - AVRCP
 
-**Implemented**: transport, volume and mute. Measured on .9 with a
+**Implemented**: transport, volume, mute and metadata. Measured on .9 with a
 Xiaomi 15T Pro connected and playing, 2026-09-17. `bluetoothd` runs with no
 `--noplugin`, so a2dp and avrcp are loaded on a stock setup.
 
@@ -145,6 +145,8 @@ connects.
 | Play, Pause, Stop, Next, Previous | `org.bluez.MediaPlayer1` on `…/dev_XX/player0` |
 | `Status` | same object — read only to compose the toggle AVRCP does not have |
 | volume and mute | `org.bluealsa.PCM1.Volume`, one uint16: high byte left, low byte right, bit 7 mute, bits 0-6 level (0-127). Measured: level 34 reads `0x2222`, muted `0xa2a2`, so a mute keeps the level |
+| metadata | `Track` — Title, Artist, Album, Genre, Duration (ms) |
+| source format | `org.bluealsa.PCM1` `Codec` + `Sampling` + `Channels`, composed — no bit depth is reported in a form worth decoding |
 
 Both object paths carry the device address, so they are looked up through each
 service's `ObjectManager` and dropped when the device leaves.
