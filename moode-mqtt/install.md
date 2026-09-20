@@ -15,8 +15,9 @@ to run alongside this bridge. Three things it cannot do:
   knob goes stale. This bridge routes every volume change through moOde's own
   REST API, which owns `volknob`, `volmute`, the amixer-vs-mpc choice and the
   propagation to multiroom receivers.
-- **Non-MPD sources.** AirPlay, Spotify Connect, Qobuz, Bluetooth and line-in
-  never touch MPD. This bridge reads the ALSA substream instead, so they count.
+- **Non-MPD sources.** AirPlay, Spotify Connect, Qobuz, Bluetooth, Squeezelite
+  and line-in never touch MPD. This bridge reads the ALSA substream instead, so
+  they count.
 - **The local display.** Not visible to MPD at all.
 
 Note that Home Assistant has **no `media_player` platform over MQTT discovery**,
@@ -235,7 +236,7 @@ on change only**.
 | `decoded_format` | what came out of its decoder: `PCM 24/48 kHz, 2ch` — see *Three formats* |
 | `cover_url` | renderer artwork URL, empty otherwise |
 | `audio` | raw MPD field `44100:24:2`, empty while a renderer plays |
-| `genre`, `date`, `bitrate`, `file`, `is_radio`, `elapsed`, `duration`, `renderer_active` | as reported |
+| `genre`, `date`, `bitrate`, `file`, `is_radio`, `duration`, `renderer_active` | as reported |
 
 **One key, one value.** A field carries the value MPD gives for it, or nothing.
 No placeholder text, no station name spilling into `artist` or `album`, and in
@@ -396,10 +397,11 @@ In automations, treat an empty field as "not provided":
 `{{ states('sensor.<id>_artist') | length > 0 }}` rather than a test against
 `unknown`.
 
-`player` carries `elapsed`, which changes every cycle, so change detection
-deliberately ignores that one field: the topic is republished when anything else
-moves, and otherwise once every 30 s (`PLAYER_REFRESH`). Without that the broker
-would get one retained message per second forever.
+Nothing in `player` moves on its own, so the topic is published when it actually
+changes and at no other time. It used to carry `elapsed`, which ticked every
+cycle: change detection had to ignore that one field, and the topic was
+republished on a timer so a late subscriber still got a fresh position. Both are
+gone with it.
 
 ### Driving the renderer itself
 
@@ -419,8 +421,9 @@ with no backend keeps its controls withdrawn, exactly as before.
 | **Qobuz Connect** | yes | yes | pibuz's HTTP API on `127.0.0.1:8182` |
 | **Bluetooth** | yes | yes | AVRCP (`org.bluez.MediaPlayer1`) for transport, BlueALSA for the mixer |
 | **AirPlay** | yes | volume only | shairport-sync's MPRIS on the system bus |
+| **Squeezelite** | yes | yes | the LMS server it is connected to, over JSON-RPC |
 | Spotify | no | no | librespot exposes no local control at all; everything goes through Spotify Connect |
-| line-in, Squeezelite, Plexamp, RoonBridge | — | — | not looked at |
+| line-in, Plexamp, RoonBridge | — | — | not looked at |
 | multiroom receiver | — | — | withdrawn; the sound is another box's |
 
 What each renderer's own interface offers, measured box in hand, is kept in
@@ -445,6 +448,40 @@ is a toggle and has to be read back first.
 Measured on a live Qobuz Connect session: `pause`, `play`, `next` and `previous`
 all followed, `dn 5` / `up 5` moved pibuz's level and not MPD's, and the `player`
 payload reported pibuz's number throughout.
+
+**Squeezelite / LMS specifics.** This is the only backend that reaches off the
+box. Squeezelite has no local control interface at all — `squeezelite -?` lists
+slimproto, LIRC and GPIO as its only inputs — so every control lives on the LMS
+server it connected to.
+
+Nothing to configure: squeezelite finds its server by broadcast and writes the
+answer nowhere, but it holds a TCP connection to it, so the bridge reads the
+address straight out of `/proc/net/tcp` (the peer on port `3483`). JSON-RPC is
+then assumed on the standard port `9000`. A server moved off that port simply
+does not answer and the controls stay withdrawn, rather than the bridge reaching
+somewhere else. Which player we are on that server is matched on the address
+squeezelite connects from, not on a guessed MAC.
+
+No credential is sent or kept. LMS authentication is optional and off by
+default; with it on the call answers `401`, the bridge logs that once and the
+Squeezelite controls stay withdrawn — the same rule as pibuz.
+
+Two things LMS does that would otherwise be read wrong, both measured: a **mute
+is carried as a negative volume** (muted at 20, it reports `-20`, keeping the
+level in the magnitude), and `mixer muting` returns *nothing at all* until
+something has set it once. The backend takes both from the volume's sign, so one
+read answers the level and the mute together.
+
+Note that `slactive` is **not** a play state: moOde writes it from
+`slpower.sh`, which LMS drives on *power* commands, and it was measured at `1`
+with squeezelite running and no server reachable at all. `state` keeps coming
+from the ALSA device being open, as it does for every renderer.
+
+Measured end to end against a real server (Lyrion 9.1.2, squeezelite
+2.0.0-1541): all six transport verbs, absolute and relative volume, and mute on
+/ off / toggle — each one verified by reading LMS's own state back afterwards,
+not by trusting the reply. Waiting on that server costs no CPU: the bridge
+measured 0.33 % of a core with Squeezelite playing, against 0.32 % idle.
 
 | command topic | payload |
 |---|---|

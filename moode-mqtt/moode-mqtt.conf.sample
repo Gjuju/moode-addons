@@ -1,48 +1,42 @@
 # moode-mqtt configuration - copy to moode-mqtt.conf and fill in.
+# Gitignored: it holds broker credentials. install.sh deploys it to
+# /etc/moode-mqtt.conf. Every key is explained in install.md.
 #
-# moode-mqtt.conf is gitignored: it holds broker credentials and must never be
-# committed. install.sh deploys it to /etc/moode-mqtt.conf as 0640 root:www-data.
+# No comment at the end of a value line - it becomes part of the value.
 
 [broker]
 host = 192.168.1.x
 port = 1883
 username =
 password =
+
+# One connection per client id: give each box its own.
 client_id = moode-mqtt
 
 [moode]
-# Instance id: used in every topic and as the Home Assistant device identifier.
-# Changing it later creates a second device in HA, so pick it once.
+# Used in every topic and as the Home Assistant device id. Pick it once:
+# changing it later creates a second device.
 instance = moode
 friendly_name = moOde
 
 topic_prefix = moode
 discovery_prefix = homeassistant
 
-# How often the display and ALSA state are sampled, in seconds. MPD changes do
-# not wait for this: the idle connection wakes the publisher immediately.
+# Display and ALSA sampling, in seconds. MPD changes do not wait for it.
 poll_interval = 1.0
 
-# Seconds the ALSA output has to stay closed before "Audio active" goes off.
-# MPD closes the device between tracks, so this must be a few seconds at least.
-# This is NOT the amp-off delay - hold that one in the Home Assistant automation
-# with `for:`, where it is easy to change.
+# Seconds the output must stay closed before "Audio active" goes off. MPD
+# closes it between tracks. This is not the amp-off delay - keep that in the
+# Home Assistant automation.
 audio_off_delay = 5.0
 
-# Default step for a bare "up" / "dn" payload on cmd/volume.
+# Step for a bare "up" / "dn" on cmd/volume.
 volume_step = 5
 
-# Base URL of this box's web server, used to make AirPlay artwork reachable: its
-# cache stores a path relative to the web root, not an absolute URL like Spotify
-# and Qobuz do. Left out or empty it is detected - the address this box uses to
-# reach the broker, which is the one Home Assistant will reach too, even with
-# Ethernet and Wi-Fi both up. Set it only for a reverse proxy or a special case.
+# Detected on its own. Set it only for a reverse proxy or a special case.
 #web_base_url = http://192.168.1.x
 
-# Check once every 12 h whether a newer moode-mqtt has been published, and expose
-# the answer as a Home Assistant binary sensor. This is the only thing that
-# reaches outside your network: one plain GET of a version file. Set to no to
-# disable it entirely.
+# The only thing reaching outside your network: one GET every 12 h.
 update_check = yes
 
 mpd_host = localhost

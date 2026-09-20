@@ -1,11 +1,17 @@
-moode-addons release notes
-==========================
+moode-mqtt release notes
+========================
 
-Newest first. Versions are per add-on; today the repository holds one.
+Newest first.
 
 
-moode-mqtt
-----------
+1.4.0  2026-09-20
+FEAT:
+- Squeezelite gains transport, volume and mute, through its LMS server.
+- The LMS server is found on its own; there is nothing to configure.
+- Squeezelite reports artist, title, album, genre and artwork.
+- The player topic is published only when it changes, instead of every 30 s.
+  The `elapsed` key that forced that is gone.
+
 
 1.3.1  2026-09-20
 FIX:

@@ -159,7 +159,7 @@ on both sides — so this is one control, not two.
 
 | what | where |
 |---|---|
-| position | `Position`, in ms — `elapsed` is still 0 for every renderer |
+| position | `Position`, in ms — the payload carries no playing position at all |
 | TrackNumber, NumberOfTracks | `Track` |
 | `Running` | `org.bluealsa.PCM1` |
 | the app playing on the phone | `Name` = `Qobuz` |
@@ -187,10 +187,79 @@ what `Previous` does varies between apps.
 
 ### Available, not used
 
-`FastForward`, `Rewind`, `Hold`, `Press`, `Release` (raw AVRCP key events),
-`Browsable` / `Searchable` / `Playlist` for browsing the phone's library, and
-**the `Track` metadata** - the bridge reads it for nothing today, so Bluetooth's
-artist/title/album stay empty.
+`FastForward`, `Rewind`, `Hold`, `Press`, `Release` (raw AVRCP key events), and
+`Browsable` / `Searchable` / `Playlist` for browsing the phone's library.
+
+---
+
+## Squeezelite - LMS (Lyrion 9.1.2), squeezelite 2.0.0-1541
+
+The odd one out: **squeezelite itself offers nothing**. `squeezelite -?` lists
+slimproto, LIRC and GPIO as its only inputs — no socket, no D-Bus, no HTTP — and
+moOde passes no `-V`, so even the volume is software inside it, driven by the
+server. Every capability below therefore belongs to LMS, on another machine.
+This is the only backend here that leaves the box.
+
+The server is not configured anywhere: squeezelite finds it by UDP broadcast and
+writes the answer nowhere, but it holds a TCP connection to it, so the address
+comes out of `/proc/net/tcp` — the peer on port `3483`. Read from `/proc` rather
+than from `ss`: same information, no fork, no privileges.
+
+### Used
+
+| what | where |
+|---|---|
+| play, pause, stop | `play` · `pause 1` · `stop` |
+| toggle | `pause` **with no argument** — LMS's own toggle, nothing to compose |
+| next, previous | `playlist index +1` · `playlist index -1` |
+| volume | `mixer volume <0-100>`, and `+N` / `-N` for a relative step — no read needed first |
+| mute | `mixer muting 1 \| 0 \| toggle` |
+| level + mute reported back | `status` → `mixer volume`, **the sign is the mute** |
+| metadata | `status` tags `algdKroTI` — artist, album, genre, duration (seconds), artwork, type, sample size and rate |
+| source format | `type` + `samplesize` + `samplerate` |
+| is it alive | the same `status` call |
+
+### Available, not used
+
+| what | where | note |
+|---|---|---|
+| playing position | `status` → `time` | the **only** renderer anywhere here that reports one. Deliberately dropped: the payload no longer carries a position at all, because a field that ticks every second is a republish every second |
+| push notifications | port **9090**, send `listen 1` | one line per event, no polling — measured working. Not retained: a plain read costs no CPU, only a wait |
+| power | `power 0 \| 1` | stops and resumes. This is what `slpower.sh` hooks to write `slactive` |
+| shuffle, repeat | `playlist shuffle` · `playlist repeat` | state seen in `status`; commands not tried. Set aside on purpose |
+| seek | `time <seconds>` | not tried |
+| the whole library | `titles` · `albums` · `artists` · `playlists` · `favorites` | browsing and queueing, far beyond this bridge |
+| queue editing | `playlist add \| load \| insert \| delete` | |
+| multiple players, sync groups | `players` · `sync` | one LMS can drive several boxes at once |
+| bitrate as text | `status` → `bitrate` | e.g. `98kbps VBR` — text, not the number the payload carries |
+
+**Measured traps, each of which would have produced a wrong reading:**
+
+- **a mute is a NEGATIVE volume.** Muted at 20, `mixer volume` answers `-20` —
+  the level is kept in the magnitude, as BlueALSA keeps it under its mute bit.
+  One `status` therefore answers both, and `mixer muting` never has to be asked.
+- **`mixer muting` answers nothing at all until something has set it once**: the
+  key is absent rather than `0`. Taking the mute from the sign sidesteps this.
+- **LMS invents placeholders**: an untagged file comes back as `No Artist`,
+  `No Album`, `No Genre`. Measured, all three. They are filtered — an invented
+  placeholder reaching Home Assistant would look like a real tag.
+- **`type` holds two different kinds of value**: a three-letter code for a local
+  file (`flc`), and a ready-made label for a stream (`MP3 Radio`). Uppercasing
+  it blindly turned the second into `MP3 RADIO`.
+- **a stream keeps its tags in `remoteMeta`**, leaving the playlist entry holding
+  the bare URL. Reading only one of the two reports a radio as having no artist.
+- **`slactive` is not a play state.** moOde writes it from `slpower.sh`, which
+  LMS drives on *power* commands: measured at `1` with squeezelite running and
+  no server reachable at all.
+- LMS reports no **decoded** format, so `oformat` is left empty rather than
+  guessed. `samplesize`/`samplerate` describe the source file.
+
+**Cost.** A `status` read is ~1 ms of server work on top of the plain network
+round trip, and waiting on it costs no CPU: the bridge measured 0.33 % of a core
+with Squeezelite playing against 0.32 % idle. LMS authentication is optional and
+off by default; with it on the call answers `401` and the controls are withdrawn.
+
+**n=1.** One LMS version, one squeezelite version, one box.
 
 ---
 
@@ -198,4 +267,14 @@ artist/title/album stay empty.
 
 - Spotify - librespot has no local control interface at all. Everything goes
   through Spotify Connect. This one is a real no.
-- Squeezelite, Plexamp, RoonBridge - never looked at.
+- Plexamp - serves the Plex player protocol on port **32500**, unauthenticated
+  on loopback: moOde ships `www/util/plexamp_status.py`, which polls
+  `/player/timeline/poll` there (and is called from nowhere). Transport, volume
+  and metadata live in the same URL space. Read, **not measured** — Plexamp
+  needs a Plex account and a claim code to install.
+- RoonBridge - RAAT, proprietary; moOde's own guide sends everything to the Roon
+  app. No local endpoint. Treat as a no, like Spotify.
+- UPnP - **not a renderer**: `upmpdcli` is a façade over MPD. Measured on the
+  box, it holds two connections to `127.0.0.1:6600` and opens no ALSA device,
+  which is why moOde raises no flag for it. MPD plays, so nothing is withdrawn
+  and moOde's own backend already drives it.

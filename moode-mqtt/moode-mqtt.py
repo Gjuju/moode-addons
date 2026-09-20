@@ -41,7 +41,7 @@ import musicpd
 import paho.mqtt.client as mqtt
 
 from backends import (AirPlayBackend, BluezBackend, MoodeBackend, PibuzBackend,
-                      TRANSPORT_ALIASES, TRANSPORT_VERBS)
+                      SqueezeliteBackend, TRANSPORT_ALIASES, TRANSPORT_VERBS)
 from moode import (DISPLAY_RECHECK, RENDERER_FLAGS, RENDERER_LABELS, db_read,
                    display_power, display_source, is_radio_stream, log,
                    moode_release, output_is_open, read_renderer_meta,
@@ -61,12 +61,6 @@ VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
 
 
 UPDATE_CHECK_INTERVAL = 12 * 3600
-
-
-# Republish the player topic at least this often even when nothing changed, so a
-# subscriber that joined late gets a fresh elapsed without us flooding the broker
-# once a second.
-PLAYER_REFRESH = 30.0
 
 
 # Entities this bridge used to announce. Removing one from the code is not
@@ -190,7 +184,6 @@ class Bridge:
         self.wake = threading.Event()
         self.published = {}
         self.player_sig = None
-        self.player_published_at = 0.0
         self.audio_closed_since = None
         self.audio_state = False
         self.display_power_state = 'unknown'
@@ -203,7 +196,8 @@ class Bridge:
 
         # Every source the bridge can drive, keyed by the flag it serves.
         self.backends = {b.flag: b for b in (MoodeBackend(), PibuzBackend(),
-                                             BluezBackend(), AirPlayBackend())}
+                                             BluezBackend(), AirPlayBackend(),
+                                             SqueezeliteBackend())}
         # Whatever is playing now. The publisher thread sets it, the MQTT thread
         # reads it, so a command can land on a source that stopped less than a
         # cycle ago - true before backends existed as well.
@@ -523,21 +517,17 @@ class Bridge:
             'date': '' if renderer_active else song.get('date', ''),
             'bitrate': int(status.get('bitrate') or 0),
             'is_radio': False if renderer_active else is_radio,
-            'elapsed': 0.0 if renderer_active else float(status.get('elapsed') or 0),
             'duration': float(meta.get('duration') or 0) if renderer_active
                         else float(status.get('duration') or 0),
             'renderer_active': renderer_active,
         }
 
-        # elapsed moves every single cycle, so comparing the whole payload would
-        # republish once a second forever. Compare everything else, and let
-        # PLAYER_REFRESH carry the position.
-        sig = json.dumps({k: v for k, v in player.items() if k != 'elapsed'},
-                         sort_keys=True)
-        now = time.monotonic()
-        if sig != self.player_sig or now - self.player_published_at >= PLAYER_REFRESH:
+        # Nothing in here moves on its own any more, so the payload goes out when
+        # it actually changes and not otherwise. It was `elapsed` that ticked
+        # every cycle, and carrying it meant republishing on a timer forever.
+        sig = json.dumps(player, sort_keys=True)
+        if sig != self.player_sig:
             self.player_sig = sig
-            self.player_published_at = now
             self.publish('player', json.dumps(player, sort_keys=True), force=True)
 
     def absolute_cover(self, url):

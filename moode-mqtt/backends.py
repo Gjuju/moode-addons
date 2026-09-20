@@ -687,3 +687,314 @@ class AirPlayBackend(DBusBackend):
                 return
             base = state[0]
         self.set_volume(base + (amount if direction == 'up' else -amount))
+
+
+# Squeezelite. The player itself has no local control interface at all -
+# measured: `squeezelite -?` lists slimproto, LIRC and GPIO as its only inputs,
+# and moOde passes no -V, so its volume is software inside squeezelite. Every
+# control lives on the LMS server it connected to, which makes this the one
+# backend that reaches off the box.
+LMS_SLIMPROTO_PORT = 3483
+
+
+# LMS serves JSON-RPC on its web port. Configurable there, but not discoverable:
+# squeezelite's connection carries the slimproto port and nothing else. A server
+# moved off 9000 simply does not answer, and the controls stay withdrawn rather
+# than reaching somewhere else.
+LMS_HTTP_PORT = 9000
+
+
+# Short on purpose. Waiting on a socket costs no CPU - the thread sleeps - but
+# the publish cycle still has to end, and this is the only backend whose peer
+# can be a machine that went away.
+LMS_TIMEOUT = 2.0
+
+
+LMS_POLL_INTERVAL = 1.0
+
+
+# LMS puts two different kinds of value in `type`, both measured: a three-letter
+# code for a local file ("flc"), and a ready-made label for a stream
+# ("MP3 Radio"). The codes are translated here; anything else is kept exactly as
+# LMS wrote it, because uppercasing turned "MP3 Radio" into "MP3 RADIO".
+LMS_CODECS = {'flc': 'FLAC', 'alc': 'ALAC', 'ops': 'Opus', 'aif': 'AIFF',
+              'mp3': 'MP3', 'aac': 'AAC', 'ogg': 'Ogg', 'wav': 'WAV',
+              'wma': 'WMA', 'pcm': 'PCM', 'dsf': 'DSD', 'dff': 'DSD'}
+
+
+def lms_hex_ipv4(text):
+    """/proc/net/tcp holds addresses little-endian: 9801A8C0 is 192.168.1.152."""
+    packed = int(text, 16)
+    return '%d.%d.%d.%d' % (packed & 0xFF, (packed >> 8) & 0xFF,
+                            (packed >> 16) & 0xFF, (packed >> 24) & 0xFF)
+
+
+def lms_endpoint():
+    """(server address, our address) taken from squeezelite's own connection.
+
+    Squeezelite finds its server by UDP broadcast and writes the answer nowhere,
+    but it holds a TCP connection to it - measured on the box:
+        192.168.1.9:54000 -> 192.168.1.152:3483
+    Read from /proc/net/tcp rather than from `ss`: the same information with no
+    fork and no privileges. The dominant cost this daemon ever carried was a
+    forked sudo, so anything running every cycle does not get to fork.
+
+    IPv4 only, because slimproto discovery is an IPv4 broadcast.
+    """
+    try:
+        with open('/proc/net/tcp') as fh:
+            rows = fh.readlines()[1:]
+    except OSError:
+        return None
+    for row in rows:
+        fields = row.split()
+        if len(fields) < 4 or fields[3] != '01':      # 01 = ESTABLISHED
+            continue
+        try:
+            remote_ip, remote_port = fields[2].split(':')
+            local_ip = fields[1].split(':')[0]
+            if int(remote_port, 16) != LMS_SLIMPROTO_PORT:
+                continue
+        except ValueError:
+            continue
+        return lms_hex_ipv4(remote_ip), lms_hex_ipv4(local_ip)
+    return None
+
+
+class SqueezeliteBackend(Backend):
+    """Squeezelite, driven through the LMS server it is connected to.
+
+    LMS answers every verb we need and more: transport, an absolute and a
+    relative volume, a real mute and full metadata. It also reports a playing
+    position, which nothing else here does and which the bridge deliberately
+    does not carry - see RENDERER-CAPABILITIES.md.
+
+    Two encodings measured on a real server (Lyrion 9.1.2, squeezelite
+    2.0.0-1541), each of which would have produced a wrong reading:
+
+    - a mute is carried as a NEGATIVE volume. Muted at 20, `mixer volume`
+      answers -20 - the level is kept in the magnitude, as BlueALSA keeps it
+      under its mute bit. So one status read gives both, and `mixer muting`
+      never has to be asked.
+    - `mixer muting` answers nothing at all until something has set it once:
+      the key is absent rather than 0. Deriving the mute from the sign avoids
+      that trap entirely.
+
+    `slactive` is NOT a play state: moOde writes it from slpower.sh, which LMS
+    drives on power commands, and it was measured at 1 with squeezelite running
+    and no server reachable at all. The state published for this source keeps
+    coming from the ALSA substream, as it does for every other renderer.
+    """
+
+    flag = 'slactive'
+    label = 'Squeezelite'
+
+    # Verified on hardware by reading the state back after each one, rather than
+    # by trusting the reply: `pause` with no argument is the toggle, `pause 1`
+    # the explicit pause, and the two playlist jumps move the index both ways.
+    VERBS = {'play': ['play'], 'pause': ['pause', 1], 'stop': ['stop'],
+             'toggle': ['pause'], 'next': ['playlist', 'index', '+1'],
+             'previous': ['playlist', 'index', '-1']}
+
+    # What LMS writes into a field it has nothing for. Measured on an untagged
+    # file: all three appear. One key holds one value here, and an invented
+    # placeholder is worse than an empty string - it would reach Home Assistant
+    # looking like a real tag.
+    PLACEHOLDERS = ('No Artist', 'No Album', 'No Genre')
+
+    # a artist, l album, g genre, d duration, K artwork URL, r bitrate,
+    # o content type, T sample rate, I sample size.
+    STATUS_TAGS = 'tags:algdKroTI'
+
+    def __init__(self):
+        self.host = None
+        self.local_ip = None
+        self.player = None
+        self.status = None
+        self.read_at = 0.0
+        self.complaint = None
+
+    def forget(self):
+        """Drop everything looked up: the server can move and the player id with
+        it, so a failed call must not pin us to an address that is gone."""
+        self.host = None
+        self.player = None
+        self.status = None
+
+    def request(self, command, player='-'):
+        """One JSON-RPC call to LMS. Its `result`, or None.
+
+        No credentials are sent or held. LMS authentication is optional and off
+        by default; with it on the call answers 401, and that is reported as
+        what it is rather than worked around - the bridge keeps no copy of
+        anyone's password, exactly as with pibuz.
+        """
+        if self.host is None:
+            return None
+        body = json.dumps({'id': 1, 'method': 'slim.request',
+                           'params': [player, list(command)]}).encode()
+        req = urllib.request.Request(
+            'http://%s:%d/jsonrpc.js' % (self.host, LMS_HTTP_PORT),
+            data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        try:
+            with urllib.request.urlopen(req, timeout=LMS_TIMEOUT) as resp:
+                raw = resp.read().decode('utf-8', 'replace')
+            self.complaint = None
+            return json.loads(raw).get('result')
+        except urllib.error.HTTPError as err:
+            problem = ('authentication is enabled there. The bridge holds no '
+                       'copy of it, so Squeezelite controls stay off.'
+                       if err.code == 401 else 'HTTP %s' % err.code)
+        except Exception as err:
+            problem = str(err)
+        # Once per problem, not once per cycle. slactive stays 1 with the server
+        # gone, so this path runs every second in an entirely ordinary
+        # situation, and a warning that fires in the nominal case teaches
+        # everyone to ignore the log.
+        if problem != self.complaint:
+            log('LMS at %s: %s' % (self.host, problem))
+            self.complaint = problem
+        return None
+
+    def resolve(self):
+        """Find the server and which player we are on it. Both are cached.
+
+        The player is matched on the address squeezelite connects from rather
+        than on a MAC we would have to guess: moOde passes no -m, so the id is
+        whichever interface squeezelite picked for itself.
+        """
+        if self.host is None:
+            found = lms_endpoint()
+            if found is None:
+                return False
+            self.host, self.local_ip = found
+        if self.player is None:
+            result = self.request(['players', 0, 99])
+            if result is None:
+                return False
+            for row in result.get('players_loop') or []:
+                if str(row.get('ip', '')).split(':')[0] == self.local_ip:
+                    self.player = str(row.get('playerid'))
+                    break
+        return self.player is not None
+
+    def poll(self):
+        """One status read per cycle, shared by everything that needs it.
+
+        It carries the state, the volume, the mute and the whole track at once,
+        so offering the controls costs no call of its own - the same reason
+        DBusBackend takes one snapshot a cycle.
+        """
+        now = time.monotonic()
+        if now - self.read_at < LMS_POLL_INTERVAL:
+            return self.status
+        self.read_at = now
+        self.status = None
+        if self.resolve():
+            self.status = self.request(['status', '-', 1, self.STATUS_TAGS],
+                                       self.player)
+        if self.status is None:
+            self.forget()
+        return self.status
+
+    def invalidate(self):
+        """Re-read on the next cycle instead of serving a level we just moved."""
+        self.read_at = 0.0
+
+    def reachable(self):
+        return self.poll() is not None
+
+    def volume_usable(self, cfg_rows):
+        # squeezelite carries its own software volume, so moOde's mixer scope
+        # does not apply: a fixed 0dB output does not stop it. moOde sets the
+        # hardware mixer to its maximum when it starts the service for exactly
+        # that reason.
+        return 'mixer volume' in (self.poll() or {})
+
+    def volume_state(self):
+        status = self.poll() or {}
+        if 'mixer volume' not in status:
+            return None
+        try:
+            level = int(status['mixer volume'])
+        except (TypeError, ValueError):
+            return None
+        # The sign is the mute; the magnitude is the level LMS will come back to.
+        return min(100, abs(level)), level < 0, 'renderer'
+
+    def track(self):
+        """The current entry, wherever this kind of source keeps it.
+
+        A stream carries its tags in remoteMeta and leaves the playlist entry
+        holding the bare URL, so reading only one of the two would report a
+        radio as having no artist at all.
+        """
+        status = self.poll() or {}
+        entry = (status.get('playlist_loop') or [{}])[0]
+        remote = status.get('remoteMeta') or {}
+        return dict(entry, **{k: v for k, v in remote.items() if v})
+
+    def text(self, track, key):
+        value = str(track.get(key, '')).strip()
+        return '' if value in self.PLACEHOLDERS else value
+
+    def metadata(self):
+        track = self.track()
+        if not track:
+            return None
+
+        meta = {'artist': self.text(track, 'artist'),
+                'title': self.text(track, 'title'),
+                'album': self.text(track, 'album'),
+                'genre': self.text(track, 'genre')}
+        try:
+            # Seconds already, unlike AVRCP and the AirPlay cache.
+            meta['duration'] = float(track.get('duration') or 0)
+        except (TypeError, ValueError):
+            meta['duration'] = 0.0
+
+        # What the server sent, which is what `sformat` means everywhere else
+        # here. What squeezelite decoded it to is not reported by anyone, so
+        # `oformat` is left empty rather than filled with a guess.
+        raw_type = str(track.get('type') or '').strip()
+        codec = LMS_CODECS.get(raw_type.lower(), raw_type)
+        size, rate = track.get('samplesize'), track.get('samplerate')
+        try:
+            if codec and size and rate:
+                meta['sformat'] = '%s %d/%g kHz' % (codec, int(size),
+                                                    int(rate) / 1000.0)
+            elif codec:
+                meta['sformat'] = codec
+        except (TypeError, ValueError):
+            meta['sformat'] = codec
+
+        # Absolute, because artwork lives on the server rather than under
+        # moOde's web root - the bridge prefixes anything relative with the
+        # player's own base URL, which would point at the wrong machine.
+        art = str(track.get('artwork_url') or '').strip()
+        if art and self.host and not art.startswith(('http://', 'https://')):
+            art = 'http://%s:%d/%s' % (self.host, LMS_HTTP_PORT, art.lstrip('/'))
+        meta['cover_url'] = art
+        return meta
+
+    def transport(self, verb):
+        self.invalidate()                  # a command acts on the state now
+        if self.resolve():
+            self.request(self.VERBS[verb], self.player)
+
+    def volume_cmd(self, *args):
+        if self.resolve():
+            self.request(['mixer'] + list(args), self.player)
+        self.invalidate()
+
+    def set_volume(self, level):
+        self.volume_cmd('volume', max(0, min(100, level)))
+
+    def step_volume(self, direction, amount):
+        # LMS takes the relative form itself, so nothing has to be read first.
+        self.volume_cmd('volume', '%s%d' % ('+' if direction == 'up' else '-',
+                                            amount))
+
+    def set_mute(self, wanted):
+        self.volume_cmd('muting', 'toggle' if wanted is None else int(bool(wanted)))
