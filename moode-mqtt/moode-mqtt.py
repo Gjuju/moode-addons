@@ -556,10 +556,10 @@ def dbus_props_all(service, path, interface):
     interface carrying 25 properties timed the same as Get on one of them. So
     reading properties one at a time buys nothing and costs a round trip each.
 
-    introspect=False throughout, here and in every other call: dbus-python
-    otherwise Introspects each proxy it builds, which measured 1.29 ms against
-    0.69 for the same GetAll. Nothing here uses the introspected API - every call
-    names its interface explicitly.
+    introspect=False, because dbus-python otherwise Introspects each proxy it
+    builds: 1.29 ms against 0.69 for the same GetAll, measured. Safe for a read,
+    which names its interface explicitly - but NOT for a write or a call, which
+    need a signature. See dbus_set_prop.
     """
     try:
         obj = dbus_bus().get_object(service, path, introspect=False)
@@ -569,8 +569,16 @@ def dbus_props_all(service, path, interface):
 
 
 def dbus_set_prop(service, path, interface, name, value):
+    """Write one property. Introspected, unlike the reads.
+
+    Measured: with introspect=False, Set answers "No such interface
+    org.freedesktop.DBus.Properties" on the very object whose GetAll had just
+    succeeded - dbus-python cannot work out the signature of the variant Set
+    takes without it. Reads are the ones worth the saving anyway: they run every
+    cycle, a command does not.
+    """
     try:
-        obj = dbus_bus().get_object(service, path, introspect=False)
+        obj = dbus_bus().get_object(service, path)
         dbus.Interface(obj, DBUS_PROPS).Set(interface, name, value)
         return True
     except Exception as err:
@@ -579,8 +587,10 @@ def dbus_set_prop(service, path, interface, name, value):
 
 
 def dbus_call(service, path, interface, method, *args):
+    """Call one method. Introspected, like the writes and for the same reason:
+    a call that carries arguments needs a signature, and a command is rare."""
     try:
-        obj = dbus_bus().get_object(service, path, introspect=False)
+        obj = dbus_bus().get_object(service, path)
         getattr(dbus.Interface(obj, interface), method)(*args)
         return True
     except Exception as err:
