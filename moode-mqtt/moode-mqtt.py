@@ -179,9 +179,17 @@ VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
                '/main/moode-mqtt/VERSION')
 UPDATE_CHECK_INTERVAL = 12 * 3600
 
-# Reading the screen state costs a sudo fork. On a headless box (no X at all,
-# the common Pi case) it will never answer, so stop asking every second.
-DISPLAY_RECHECK_HEADLESS = 60.0
+# Reading the screen state costs a fork, which makes it by far the most
+# expensive thing in a cycle - so it runs on a timer rather than every time.
+# Measured on an x86 box with a touch panel: 26 ms of CPU per call through sudo,
+# against 3.7 ms for everything else the cycle does put together. The sensor it
+# feeds is informational, and deliberately not the amp signal: that is `audio`,
+# which keeps the poll interval. moOde's own worker asks the same question every
+# 3 s, so there is no point being quicker than the thing being watched.
+DISPLAY_RECHECK = 10.0
+
+# Which invocation of xset actually answered, remembered after the first call.
+_XSET_PREFIX = None
 
 # cfg_system flags moOde sets while a non-MPD source is playing (common.php,
 # chkRendererActive()), each with the label its own WebUI shows (playerlib.js).
@@ -352,19 +360,28 @@ def display_power():
     (input inactivity, no relation to audio). This reports the result of either,
     which is why it must not be used to decide whether the amp should be on.
     """
-    try:
-        env = dict(os.environ, DISPLAY=':0')
-        out = subprocess.run(['sudo', '-E', 'xset', 'q'], env=env, timeout=5,
-                             capture_output=True, text=True).stdout
-    except (subprocess.SubprocessError, OSError):
-        return 'unknown'
+    global _XSET_PREFIX
+    env = dict(os.environ, DISPLAY=':0')
+    # Nothing here is privileged: moOde runs X as root with no auth file, so
+    # www-data reaches it directly. Measured, same answer either way: 3.86 ms of
+    # CPU plain against 25.83 through sudo, which is PAM and sudoers parsing for
+    # a question about a screen. sudo stays as a fallback for a box whose X does
+    # demand authorisation - not a case this could test.
+    attempts = [_XSET_PREFIX] if _XSET_PREFIX is not None else [[], ['sudo', '-E']]
 
-    for line in out.splitlines():
-        if 'Monitor is ' in line:
-            # "Monitor is On" / "in Standby" / "in Suspend" / "Off" - the state
-            # is not always one word, so keep everything after the marker.
-            state = line.split('Monitor is ', 1)[1].strip()
-            return 'on' if state == 'On' else 'standby'
+    for prefix in attempts:
+        try:
+            out = subprocess.run(prefix + ['xset', 'q'], env=env, timeout=5,
+                                 capture_output=True, text=True).stdout
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            if 'Monitor is ' in line:
+                _XSET_PREFIX = prefix
+                # "Monitor is On" / "in Standby" / "in Suspend" / "Off" - the
+                # state is not always one word, so keep everything after it.
+                state = line.split('Monitor is ', 1)[1].strip()
+                return 'on' if state == 'On' else 'standby'
     return 'unknown'
 
 
@@ -1223,8 +1240,7 @@ class Bridge:
         self.publish('display/app', app)
 
         now = time.monotonic()
-        if (self.display_power_state != 'unknown'
-                or now - self.display_power_checked_at >= DISPLAY_RECHECK_HEADLESS):
+        if now - self.display_power_checked_at >= DISPLAY_RECHECK:
             self.display_power_state = display_power()
             self.display_power_checked_at = now
         # Headless box: publish nothing rather than inventing an OFF. The HA
