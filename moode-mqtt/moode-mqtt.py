@@ -108,6 +108,25 @@ def installed_version():
         return ''
 
 
+def is_newer(published, installed):
+    """Is `published` actually ahead of `installed`?
+
+    Not merely different. Being ahead of the published version is an ordinary
+    state - running a branch, or the minutes raw.githubusercontent.com takes to
+    stop serving the previous VERSION after a release - and announcing an update
+    then is a warning that is wrong, which teaches people to ignore the rest.
+
+    Falls back to plain inequality if either side is not a dotted number, so an
+    unexpected format still reports something rather than nothing.
+    """
+    def parts(v):
+        return tuple(int(x) for x in v.split('.'))
+    try:
+        return parts(published) > parts(installed)
+    except ValueError:
+        return published != installed
+
+
 def published_version():
     """The published VERSION of this sub-project, or None when unreachable.
 
@@ -546,9 +565,10 @@ class Bridge:
         latest = published_version()
         if latest is None:
             return          # unreachable: leave the sensor as it was
-        if latest != self.version:
+        newer = is_newer(latest, self.version)
+        if newer:
             log('update available: %s installed, %s published' % (self.version, latest))
-        self.publish('update/available', 'ON' if latest != self.version else 'OFF')
+        self.publish('update/available', 'ON' if newer else 'OFF')
 
     # Home Assistant discovery
 

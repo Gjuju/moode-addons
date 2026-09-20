@@ -1,0 +1,66 @@
+moode-addons release notes
+==========================
+
+Newest first. Versions are per add-on; today the repository holds one.
+
+
+moode-mqtt
+----------
+
+1.3.1  2026-09-20
+FIX:
+- the Update sensor lit when the installed version was ahead of the
+  published one.
+
+
+1.3.0  2026-09-20
+BREAKING:
+- the daemon moved to /usr/local/lib/moode-mqtt/; upgrading removes the old
+  /usr/local/bin/moode-mqtt.py.
+
+FEAT:
+- Split into three modules.
+
+
+1.2.0  2026-09-20
+BREAKING:
+- the Quality sensor is gone. It reported the container, not the
+  recording.
+- `quality` is gone from the player payload.
+- `volume` and `mute` report the renderer's level while one plays.
+- `volume_scope` has a fourth value, `renderer`.
+- `genre` and `date` are blank while a renderer plays.
+
+FEAT:
+- Transport, volume and mute work during a renderer instead of being greyed out.
+- Qobuz and Bluetooth fully, AirPlay without mute, Spotify not at all.
+- No new entities: the existing buttons and slider stop being withdrawn.
+- The player that is playing owns the level reported.
+- Bluetooth reports artist, title, album and genre, read from AVRCP.
+- `source_format` (the codec) and `decoded_format` (what the decoder gave).
+- Nine times lighter on a box with a screen: no more `sudo` fork every second.
+- D-Bus state read in one batch per cycle.
+- New dependency python3-dbus, already present on moOde.
+
+FIX:
+- several wrong statements in install.md, including a config example that
+  would have set your broker username to a comment if pasted.
+
+
+1.1.1  2026-09-17
+FIX:
+- removed a startup check that flagged configuration keys wrongly.
+
+
+1.1.0  2026-09-17
+FEAT:
+- `web_base_url` is detected instead of configured.
+- The update check runs every 12 hours instead of every 4.
+
+
+Upgrading
+---------
+
+    cd moode-addons && git pull && cd moode-mqtt && sudo ./install.sh
+
+moode-mqtt.conf is gitignored and never overwritten.
