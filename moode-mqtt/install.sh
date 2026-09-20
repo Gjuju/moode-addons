@@ -52,7 +52,9 @@ deploy() { # <src> <dst> <mode> <owner:group>
 
 say "-- Dependencies"
 MISSING=""
-for pkg in python3-paho-mqtt python3-musicpd; do
+# python3-dbus drives the Bluetooth and AirPlay renderers. It is already
+# present on stock moOde, Pi included, so this is normally a no-op.
+for pkg in python3-paho-mqtt python3-musicpd python3-dbus; do
 	dpkg -s "$pkg" >/dev/null 2>&1 || MISSING="$MISSING $pkg"
 done
 if [ -n "$MISSING" ]; then
@@ -62,7 +64,7 @@ if [ -n "$MISSING" ]; then
 	apt-get install -y $MISSING || { warn "apt-get failed"; exit 1; }
 	ok "installed:$MISSING"
 else
-	say "     already present: python3-paho-mqtt python3-musicpd"
+	say "     already present: python3-paho-mqtt python3-musicpd python3-dbus"
 fi
 
 say

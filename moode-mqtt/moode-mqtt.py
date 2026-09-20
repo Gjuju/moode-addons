@@ -10,11 +10,15 @@
 #
 # Design notes that matter:
 #
-# - Commands ALWAYS go through moOde's REST API (www/command/index.php), never
-#   straight to MPD or vol.sh. That endpoint carries moOde's internal mechanisms:
-#   set_volume propagates to multiroom receivers and refuses while a renderer is
-#   active, toggle_play_pause knows the radio rule. Bypassing it drops all of
-#   that silently.
+# - Commands go through moOde's REST API (www/command/index.php) wherever moOde
+#   HAS a mechanism, never straight to MPD or vol.sh. That endpoint carries
+#   moOde's internal mechanisms: set_volume propagates to multiroom receivers and
+#   refuses while a renderer is active, toggle_play_pause knows the radio rule.
+#   Bypassing it drops all of that silently.
+#   The exception is a renderer, where moOde has no mechanism at all to bypass:
+#   command/index.php has no transport command for one, and moOde's own WebUI
+#   offers only "disconnect" while one plays (playerlib.js). A renderer backend
+#   fills that gap - it does not route around anything.
 # - "Audio active" is read from the ALSA substream (hw_params), not from MPD, so
 #   AirPlay / Spotify / Bluetooth / line-in count too. touchmon.php uses the same
 #   source. MPD closes the device between tracks, hence AUDIO_OFF_DELAY.
@@ -33,11 +37,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
+import dbus
 import musicpd
 import paho.mqtt.client as mqtt
+
+_SYSTEM_BUS = None
 
 CONF_PATH = os.environ.get('MOODE_MQTT_CONF', '/etc/moode-mqtt.conf')
 SQLDB = '/var/local/www/db/moode-sqlite3.db'
@@ -93,51 +101,6 @@ def volume_scope(cfg_rows):
     if mixer == 'none':
         return 'none'
     return 'hardware' if mixer == 'hardware' else 'mpd'
-
-
-def format_quality(params, status=None):
-    """Readable output format from ALSA hw_params.
-
-    Preferred over MPD's status 'audio' because MPD reports nothing at all while
-    a renderer holds the device, and this is the real thing anyway: resampling
-    and CamillaDSP included.
-
-    The format designators handled here mirror moOde's own parser in
-    inc/alsa.php (getAlsaHwParams) - keep the two in step.
-    """
-    if not params:
-        return ''
-    fmt = params.get('format', '')
-    rate = (params.get('rate', '') or '').split(' ')[0]
-    if not fmt or not rate.isdigit():
-        return ''
-
-    khz_only = '%g kHz' % (int(rate) / 1000)
-
-    # S/PDIF carries its samples in a subframe whose name says nothing about the
-    # depth, so the digits in it are not a bit count. MPD knows the real depth
-    # when it is the one playing; nothing does otherwise, so report the rate
-    # alone rather than inventing a number.
-    if fmt == 'IEC958_SUBFRAME_LE':
-        mpd_bits = ((status or {}).get('audio') or '').split(':')
-        if len(mpd_bits) > 1 and mpd_bits[1].isdigit():
-            return '%s bit / %s' % (mpd_bits[1], khz_only)
-        return khz_only
-
-    head = fmt.split('_')[0]                       # S32, S24, FLOAT, DSD
-    if fmt.startswith('DSD'):
-        # DSD_U32_BE at 88200 carries 32 bits per frame: 88200 x 32 = DSD64.
-        carrier = ''.join(c for c in fmt.split('_')[1] if c.isdigit()) or '8'
-        multiple = int(rate) * int(carrier) / 44100
-        if multiple == int(multiple):
-            return 'DSD%d' % multiple
-        return 'DSD %g kHz' % (int(rate) / 1000)
-
-    khz = '%g' % (int(rate) / 1000)
-    bits = ''.join(c for c in head if c.isdigit())
-    if bits:
-        return '%s bit / %s kHz' % (bits, khz)
-    return '%s / %s kHz' % (head.lower(), khz)
 
 
 def local_address(host, port):
@@ -216,9 +179,15 @@ VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
                '/main/moode-mqtt/VERSION')
 UPDATE_CHECK_INTERVAL = 12 * 3600
 
-# Reading the screen state costs a sudo fork. On a headless box (no X at all,
-# the common Pi case) it will never answer, so stop asking every second.
-DISPLAY_RECHECK_HEADLESS = 60.0
+# Reading the screen state costs a fork, which makes it by far the most
+# expensive thing in a cycle - so it runs on a timer, and only where moOde
+# configured a display at all.
+# Measured on an x86 box with a touch panel: 26 ms of CPU per call through sudo,
+# against 3.7 ms for everything else the cycle does put together. The sensor it
+# feeds is informational, and deliberately not the amp signal: that is `audio`,
+# which keeps the poll interval. moOde's own worker asks the same question every
+# 3 s, so there is no point being quicker than the thing being watched.
+DISPLAY_RECHECK = 10.0
 
 # cfg_system flags moOde sets while a non-MPD source is playing (common.php,
 # chkRendererActive()), each with the label its own WebUI shows (playerlib.js).
@@ -243,7 +212,51 @@ RENDERER_META_FILES = {
     'qbzactive': ('/var/local/www/qbzmeta.json', 1),
 }
 
-TRANSPORT_CMDS = ('play', 'pause', 'stop', 'toggle', 'next', 'previous', 'prev')
+# The verbs a backend must implement to be registered at all. Every real
+# candidate does (moOde/MPD, pibuz, shairport-sync, Bluetooth AVRCP), so
+# advertising them one by one would be machinery for a case that does not exist.
+TRANSPORT_VERBS = ('play', 'pause', 'toggle', 'stop', 'next', 'previous')
+TRANSPORT_ALIASES = {'prev': 'previous'}
+
+# Entities this bridge used to announce. Removing one from the code is not
+# enough: its discovery config was published retained, so Home Assistant keeps
+# showing it until an empty payload replaces it. Drop an entry once every install
+# has run a version that retired it.
+RETIRED_ENTITIES = (('sensor', 'quality'),)
+
+# pibuz (Qobuz Connect) control API. Unauthenticated by its own default, and
+# reachable by www-data - both measured, not assumed.
+DBUS_PROPS = 'org.freedesktop.DBus.Properties'
+DBUS_OBJMGR = 'org.freedesktop.DBus.ObjectManager'
+
+# Bluetooth. The phone is the source and this player the sink, so the phone
+# exposes the media player and we are the remote.
+BLUEZ = 'org.bluez'
+BLUEZ_PLAYER = 'org.bluez.MediaPlayer1'
+BLUEALSA = 'org.bluealsa'
+BLUEALSA_ROOT = '/org/bluealsa'
+BLUEALSA_PCM = 'org.bluealsa.PCM1'
+# BlueALSA packs both channels into one uint16 - high byte left, low byte right
+# - and in each byte bit 7 is mute with the level in bits 0-6. Measured: level
+# 34 on both channels reads 0x2222, and muting it reads 0xa2a2, so a mute keeps
+# the level rather than zeroing it.
+BT_MUTE_BIT = 0x80
+BT_LEVEL_MAX = 0x7F
+
+# AirPlay. shairport-sync publishes MPRIS on the SYSTEM bus, plus its own
+# interface carrying what MPRIS has no room for.
+MPRIS_NAME = 'org.mpris.MediaPlayer2.ShairportSync'
+MPRIS_PATH = '/org/mpris/MediaPlayer2'
+MPRIS_PLAYER = 'org.mpris.MediaPlayer2.Player'
+SHAIRPORT_NAME = 'org.gnome.ShairportSync'
+SHAIRPORT_PATH = '/org/gnome/ShairportSync'
+SHAIRPORT_IFACE = 'org.gnome.ShairportSync'
+
+PIBUZ_API = 'http://127.0.0.1:8182'
+# One local HTTP read per publish cycle, and only while Qobuz plays. Cheap
+# against a Rust daemon on loopback - unlike a PHP fork, which is why moOde's
+# own state is still read directly.
+PIBUZ_POLL_INTERVAL = 1.0
 
 running = True
 
@@ -309,12 +322,13 @@ def db_read(params):
         return {}
 
 
-def read_hw_params(cfg_rows):
-    """Parsed ALSA hw_params of the output substream, or None when it is closed.
+def output_is_open(cfg_rows):
+    """Is the output substream open - by anyone: MPD, AirPlay, Qobuz, Bluetooth.
 
-    This is the one place that knows what the DAC is actually being fed, whoever
-    opened it - MPD, AirPlay, Qobuz, Bluetooth. Mirrors moodeutl --hwparams: in
-    multiroom transmitter mode the real output is the ALSA Loopback.
+    The one signal that does not depend on who is playing, which is why "audio
+    active" and a renderer's play state both come from here rather than from MPD.
+    Mirrors moodeutl --hwparams: in multiroom transmitter mode the real output is
+    the ALSA Loopback.
     """
     if cfg_rows.get('multiroom_tx') == 'On':
         try:
@@ -322,7 +336,7 @@ def read_hw_params(cfg_rows):
                 card = next(line.split(': ')[1].strip()
                             for line in fh if line.startswith('card'))
         except (OSError, StopIteration):
-            return None
+            return False
     else:
         card = cfg_rows.get('cardnum', '0')
 
@@ -330,18 +344,10 @@ def read_hw_params(cfg_rows):
         with open('/proc/asound/card%s/pcm0p/sub0/hw_params' % card) as fh:
             text = fh.read().strip()
     except OSError:
-        return None
+        return False
     # moOde's own parser treats both of these as "nothing playing" (inc/alsa.php,
     # getAlsaHwParams).
-    if not text or text in ('closed', 'no setup'):
-        return None
-
-    params = {}
-    for line in text.splitlines():
-        if ':' in line:
-            key, value = line.split(':', 1)
-            params[key.strip()] = value.strip()
-    return params
+    return bool(text) and text not in ('closed', 'no setup')
 
 
 def display_power():
@@ -352,9 +358,14 @@ def display_power():
     (input inactivity, no relation to audio). This reports the result of either,
     which is why it must not be used to decide whether the amp should be on.
     """
+    # No sudo: moOde runs Xorg as root with no auth file, so www-data reaches it
+    # directly. Verified on every box here that has an X server, a stock Pi
+    # included. It is not a style preference - the same call through sudo costs
+    # 51 ms of CPU on a Pi 3 against 6.3 plain, and on a box with no X at all it
+    # is 68 ms to fail rather than 7.5.
+    env = dict(os.environ, DISPLAY=':0')
     try:
-        env = dict(os.environ, DISPLAY=':0')
-        out = subprocess.run(['sudo', '-E', 'xset', 'q'], env=env, timeout=5,
+        out = subprocess.run(['xset', 'q'], env=env, timeout=5,
                              capture_output=True, text=True).stdout
     except (subprocess.SubprocessError, OSError):
         return 'unknown'
@@ -362,7 +373,8 @@ def display_power():
     for line in out.splitlines():
         if 'Monitor is ' in line:
             # "Monitor is On" / "in Standby" / "in Suspend" / "Off" - the state
-            # is not always one word, so keep everything after the marker.
+            # is not always one word, so keep everything after the marker. moOde
+            # takes the third field here, which yields "in" for a standby.
             state = line.split('Monitor is ', 1)[1].strip()
             return 'on' if state == 'On' else 'standby'
     return 'unknown'
@@ -410,6 +422,596 @@ def moode_api(cmd):
     return data
 
 
+# Renderer control backends
+#
+# One backend serves one source: the cfg_system flag moOde raises while that
+# renderer plays, or None for moOde's own player. The bridge picks the backend
+# matching what is playing and routes every command to it; a source with no
+# backend gets its controls withdrawn in Home Assistant rather than a button that
+# moves something else.
+#
+# Contract: implement all six transport verbs, or do not register. Volume is
+# optional and declared, because it genuinely varies - AVRCP has no volume, and
+# even moOde's own has none on a fixed 0dB output.
+
+
+class Backend:
+    """What the bridge needs from any source it can drive."""
+
+    flag = None            # cfg_system flag this backend serves; None = moOde/MPD
+    label = 'moOde'
+
+    def reachable(self):
+        """Is the mechanism answering right now? Checked every publish cycle."""
+        return True
+
+    def invalidate(self):
+        """Drop anything cached for the current cycle.
+
+        Called once per cycle by the publisher, and by a command before it acts
+        on what it reads. A backend that caches nothing has nothing to do.
+        """
+
+    def volume_usable(self, cfg_rows):
+        """Can this backend move the volume, given moOde's current config?
+
+        Each backend answers from the state it actually depends on, rather than
+        the bridge guessing on its behalf: moOde's mixer scope says nothing about
+        a renderer's own software volume.
+        """
+        return False
+
+    def mute_usable(self, cfg_rows):
+        """Separate from volume, because they genuinely come apart.
+
+        AirPlay has a volume and no readable mute at all: shairport-sync offers
+        `mutetoggle` with nothing to read back, and a switch that toggles blind
+        would show a state it does not know. Everything else answers the same as
+        its volume.
+        """
+        return self.volume_usable(cfg_rows)
+
+    def metadata(self):
+        """Track information from the source itself, shaped like moOde's caches
+        (artist, title, album, genre, duration in seconds, sformat, cover_url),
+        or None to fall back to the cache.
+
+        None is the right answer wherever moOde already caches the renderer: that
+        file is written by the renderer itself and costs a read to use.
+        """
+        return None
+
+    def volume_state(self):
+        """(level 0-100, muted, scope) as this backend sees it, or None.
+
+        None means the bridge keeps reporting moOde's own knob. A backend that
+        moves its own volume MUST answer here, or the number in Home Assistant
+        would come from one player while the slider moved another.
+        """
+        return None
+
+    def transport(self, verb):
+        raise NotImplementedError
+
+    def set_volume(self, level):
+        raise NotImplementedError
+
+    def step_volume(self, direction, amount):
+        raise NotImplementedError
+
+    def set_mute(self, wanted):
+        """wanted: True to mute, False to unmute, None to toggle."""
+        raise NotImplementedError
+
+
+class MoodeBackend(Backend):
+    """moOde's own player, driven through its REST API."""
+
+    flag = None
+    label = 'moOde'
+
+    def volume_usable(self, cfg_rows):
+        # A fixed 0dB output has no volume to move: moOde's own volume command
+        # changes nothing there.
+        return volume_scope(cfg_rows) != 'none'
+
+    def transport(self, verb):
+        if verb == 'toggle':
+            # moOde already knows to stop a radio and pause anything else
+            moode_api('toggle_play_pause')
+        else:
+            moode_api(verb)
+
+    def set_volume(self, level):
+        moode_api('set_volume %d' % level)
+
+    def step_volume(self, direction, amount):
+        moode_api('set_volume %s %d' % ('-up' if direction == 'up' else '-dn', amount))
+
+    def set_mute(self, wanted):
+        """set_volume -mute is a TOGGLE, so honour an explicit on/off request."""
+        if wanted is not None:
+            current = moode_api('get_volume') or {}
+            if (current.get('muted') == 'yes') == wanted:
+                return
+        moode_api('set_volume -mute')
+
+
+def dbus_bus():
+    """The system bus, opened on first use.
+
+    Lazily, because a player that never sees a renderer never needs it, and
+    because a failure here has to withdraw a control rather than kill the daemon.
+    """
+    global _SYSTEM_BUS
+    if _SYSTEM_BUS is None:
+        _SYSTEM_BUS = dbus.SystemBus()
+    return _SYSTEM_BUS
+
+
+def dbus_props_all(service, path, interface):
+    """Every property of one interface in a single round trip, or None.
+
+    Measured: a round trip costs about 2 ms whatever comes back - GetAll over an
+    interface carrying 25 properties timed the same as Get on one of them. So
+    reading properties one at a time buys nothing and costs a round trip each.
+
+    introspect=False, because dbus-python otherwise Introspects each proxy it
+    builds: 1.29 ms against 0.69 for the same GetAll, measured. Safe for a read,
+    which names its interface explicitly - but NOT for a write or a call, which
+    need a signature. See dbus_set_prop.
+    """
+    try:
+        obj = dbus_bus().get_object(service, path, introspect=False)
+        return dbus.Interface(obj, DBUS_PROPS).GetAll(interface)
+    except Exception:
+        return None
+
+
+def dbus_set_prop(service, path, interface, name, value):
+    """Write one property. Introspected, unlike the reads.
+
+    Measured: with introspect=False, Set answers "No such interface
+    org.freedesktop.DBus.Properties" on the very object whose GetAll had just
+    succeeded - dbus-python cannot work out the signature of the variant Set
+    takes without it. Reads are the ones worth the saving anyway: they run every
+    cycle, a command does not.
+    """
+    try:
+        obj = dbus_bus().get_object(service, path)
+        dbus.Interface(obj, DBUS_PROPS).Set(interface, name, value)
+        return True
+    except Exception as err:
+        log('D-Bus set %s.%s failed: %s' % (interface, name, err))
+        return False
+
+
+def dbus_call(service, path, interface, method, *args):
+    """Call one method. Introspected, like the writes and for the same reason:
+    a call that carries arguments needs a signature, and a command is rare."""
+    try:
+        obj = dbus_bus().get_object(service, path)
+        getattr(dbus.Interface(obj, interface), method)(*args)
+        return True
+    except Exception as err:
+        log('D-Bus %s.%s failed: %s' % (interface, method, err))
+        return False
+
+
+def dbus_find(service, interface, root='/'):
+    """First object under `service` implementing `interface`, or None.
+
+    Looked up rather than configured: the path carries the device address, so it
+    changes with every phone that connects.
+    """
+    try:
+        obj = dbus_bus().get_object(service, root, introspect=False)
+        managed = dbus.Interface(obj, DBUS_OBJMGR).GetManagedObjects()
+    except Exception:
+        return None
+    for path, interfaces in managed.items():
+        if interface in interfaces:
+            return str(path)
+    return None
+
+
+def pibuz_request(path, body=None, method='POST'):
+    """One call to pibuz's control API. Parsed JSON, or None if it did not work.
+
+    No Authorization header. pibuz ships with `[server] token` unset, which its
+    own source documents as an unauthenticated control plane on loopback and LAN
+    alike, and no qbzd.toml exists unless someone writes one. If a token IS set
+    the call answers 401, and that is reported as what it is: the bridge keeps no
+    copy of anyone's secret, so there is nothing here to leak or to rotate.
+    """
+    data = json.dumps(body).encode() if body is not None else b''
+    req = urllib.request.Request(PIBUZ_API + path, data=data, method=method)
+    if body is not None:
+        req.add_header('Content-Type', 'application/json')
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode('utf-8', 'replace').strip()
+    except urllib.error.HTTPError as err:
+        if err.code == 401:
+            log('pibuz refused %s: a token is set in its qbzd.toml. The bridge '
+                'holds no copy of it, so Qobuz controls stay off.' % path)
+        else:
+            log('pibuz %s failed: HTTP %s' % (path, err.code))
+        return None
+    except Exception as err:
+        log('pibuz %s failed: %s' % (path, err))
+        return None
+
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+
+
+class PibuzBackend(Backend):
+    """Qobuz Connect, driven through pibuz's own HTTP API.
+
+    Nothing is being routed around here: moOde has no command for this renderer,
+    and its WebUI offers only "disconnect" while one plays. pibuz is the only
+    thing that can move it.
+
+    Its six transport routes carry exactly our verb names, so no translation
+    table earns its keep. pibuz is started by moOde on demand and is simply
+    absent the rest of the time, so "not answering" is a normal state, not a
+    fault: the controls are withdrawn and that is all.
+    """
+
+    flag = 'qbzactive'
+    label = 'Qobuz'
+
+    def __init__(self):
+        self.status = None
+        self.read_at = 0.0
+
+    def poll(self):
+        """One /api/status read per publish cycle, shared by every caller.
+
+        It answers "is pibuz there" and "where is its volume" at the same time,
+        so knowing whether to offer the controls costs no extra call.
+        """
+        now = time.monotonic()
+        if now - self.read_at >= PIBUZ_POLL_INTERVAL:
+            self.read_at = now
+            self.status = pibuz_request('/api/status', method='GET')
+        return self.status
+
+    def invalidate(self):
+        """Re-read on the next cycle instead of serving a level we just moved."""
+        self.read_at = 0.0
+
+    def reachable(self):
+        return self.poll() is not None
+
+    def volume_usable(self, cfg_rows):
+        # pibuz has its own software volume, so moOde's mixer scope does not
+        # apply: a fixed 0dB output does not stop it.
+        return True
+
+    def volume_state(self):
+        playback = (self.poll() or {}).get('playback') or {}
+        level = playback.get('volume')
+        if level is None:
+            return None
+        # pibuz works in 0.0-1.0, Home Assistant and moOde in 0-100. Measured:
+        # /api/status reports the LIVE level, so it reads 0 while muted and
+        # comes back on unmute - pibuz keeps the pre-mute level to itself
+        # (nominal_volume is applied on its command routes, not here).
+        return int(round(level * 100)), bool(playback.get('muted')), 'renderer'
+
+    def transport(self, verb):
+        if pibuz_request('/api/playback/%s' % verb) is None:
+            self.invalidate()
+
+    def set_volume(self, level):
+        self.volume_cmd({'volume': max(0, min(100, level)) / 100.0})
+
+    def step_volume(self, direction, amount):
+        delta = amount / 100.0
+        self.volume_cmd({'delta': delta if direction == 'up' else -delta})
+
+    def set_mute(self, wanted):
+        # pibuz takes the explicit form, so unlike moOde there is no need to
+        # read the current state before deciding.
+        self.volume_cmd({'mute': 'toggle' if wanted is None
+                         else ('on' if wanted else 'off')})
+
+    def volume_cmd(self, body):
+        pibuz_request('/api/playback/volume', body)
+        self.invalidate()
+
+
+class DBusBackend(Backend):
+    """A backend that reads its state from D-Bus properties, one snapshot a cycle.
+
+    Every value a cycle publishes then comes from the same instant. Reading
+    property by property did not only cost a round trip each - it also let the
+    parts of one payload drift milliseconds apart, so a track could be reported
+    against a volume read after it changed.
+
+    The publisher clears the snapshot at the top of each cycle; a command clears
+    it too, since it must act on what is true now rather than on what was true
+    up to a second ago.
+    """
+
+    def __init__(self):
+        self.snapshot = {}
+
+    def invalidate(self):
+        self.snapshot = {}
+
+    def props(self, service, path, interface):
+        """One interface's properties, fetched at most once per cycle."""
+        if path is None:
+            return {}
+        key = (service, path, interface)
+        if key not in self.snapshot:
+            self.snapshot[key] = dbus_props_all(service, path, interface) or {}
+        return self.snapshot[key]
+
+
+class BluezBackend(DBusBackend):
+    """Bluetooth: AVRCP for transport, BlueALSA for the mixer.
+
+    Two services, each owning what it owns. bluez carries the remote-control
+    session with the phone; BlueALSA carries the local mixer, whose level is the
+    same value bluez publishes on MediaTransport1 - measured equal on both sides
+    - plus a real mute flag bluez does not expose at all.
+
+    We are the remote here, not the player, so the phone decides what a command
+    does: `Previous` past the first seconds of a track restarts it instead of
+    going back. That is the phone's rule, and not something to correct.
+    """
+
+    flag = 'btactive'
+    label = 'Bluetooth'
+
+    VERBS = {'play': 'Play', 'pause': 'Pause', 'stop': 'Stop',
+             'next': 'Next', 'previous': 'Previous'}
+
+    def __init__(self):
+        super().__init__()
+        self.player = None
+        self.pcm = None
+
+    def forget(self):
+        """Both paths carry the device address, so a disconnect invalidates them."""
+        self.player = None
+        self.pcm = None
+        self.invalidate()
+
+    def player_props(self):
+        return self.props(BLUEZ, self.player_path(), BLUEZ_PLAYER)
+
+    def pcm_props(self):
+        return self.props(BLUEALSA, self.pcm_path(), BLUEALSA_PCM)
+
+    def player_path(self):
+        if self.player is None:
+            self.player = dbus_find(BLUEZ, BLUEZ_PLAYER)
+        return self.player
+
+    def pcm_path(self):
+        if self.pcm is None:
+            self.pcm = dbus_find(BLUEALSA, BLUEALSA_PCM, BLUEALSA_ROOT)
+        return self.pcm
+
+    def reachable(self):
+        if self.player_path() is None:
+            return False
+        if 'Status' not in self.player_props():
+            self.forget()                  # the device left, the path is stale
+            return False
+        return True
+
+    def volume_usable(self, cfg_rows):
+        return self.raw_volume() is not None
+
+    def raw_volume(self):
+        """(level 0-127, muted) exactly as BlueALSA holds it, or None.
+
+        Kept on BlueALSA's own scale so a mute or a step does not round-trip
+        through 0-100 and drift.
+        """
+        raw = self.pcm_props().get('Volume')
+        if raw is None:
+            self.pcm = None
+            return None
+        left = (int(raw) >> 8) & 0xFF
+        return left & BT_LEVEL_MAX, bool(left & BT_MUTE_BIT)
+
+    def write_volume(self, level, muted):
+        byte = (BT_MUTE_BIT if muted else 0) | max(0, min(BT_LEVEL_MAX, level))
+        # Both channels together: this bridge has one volume, not a balance.
+        return dbus_set_prop(BLUEALSA, self.pcm_path(), BLUEALSA_PCM, 'Volume',
+                             dbus.UInt16((byte << 8) | byte))
+
+    def volume_state(self):
+        raw = self.raw_volume()
+        if raw is None:
+            return None
+        level, muted = raw
+        return int(round(level * 100.0 / BT_LEVEL_MAX)), muted, 'renderer'
+
+    def metadata(self):
+        """AVRCP carries what moOde caches for every other renderer and never
+        caches for this one - which is why Bluetooth's fields were the only ones
+        permanently empty."""
+        track = self.player_props().get('Track')
+        if track is None:
+            return None
+
+        def text(key):
+            return str(track.get(key, '')).strip()
+
+        meta = {'artist': text('Artist'), 'title': text('Title'),
+                'album': text('Album'), 'genre': text('Genre')}
+        try:
+            # AVRCP reports milliseconds, as AirPlay and Spotify's caches do.
+            meta['duration'] = float(track.get('Duration', 0)) / 1000.0
+        except (TypeError, ValueError):
+            meta['duration'] = 0.0
+
+        # Source and decoded are two different things, and moOde keeps them
+        # apart: the codec alone is the source - aptX-HD is lossy and carries no
+        # bit depth of its own - while the depth and rate belong to what came
+        # out of the decoder. audioinfo.php reads the same two places.
+        pcm = self.pcm_props()
+        if pcm:
+            codec = pcm.get('Codec')
+            if codec:
+                meta['sformat'] = str(codec)
+            # PCM1.Format is the numeric form of the name bluealsa-cli prints:
+            # S24_LE reads 0x8418, whose low byte is the 24. moOde takes the
+            # same figure out of the string.
+            fmt = pcm.get('Format')
+            rate = pcm.get('Sampling')
+            channels = pcm.get('Channels')
+            if fmt and rate:
+                # Shaped like the oformat the other renderers' caches carry, so
+                # one key holds one kind of value whoever filled it.
+                meta['oformat'] = 'PCM %d/%g kHz, %dch' % (
+                    int(fmt) & 0xFF, int(rate) / 1000.0, int(channels or 2))
+        return meta
+
+    def transport(self, verb):
+        self.invalidate()                  # a command acts on the state now
+        path = self.player_path()
+        if path is None:
+            return
+        if verb == 'toggle':
+            # AVRCP has no toggle, so ask what it is doing before deciding.
+            status = str(self.player_props().get('Status') or '')
+            verb = 'pause' if status == 'playing' else 'play'
+        if not dbus_call(BLUEZ, path, BLUEZ_PLAYER, self.VERBS[verb]):
+            self.forget()
+
+    def set_volume(self, level):
+        self.invalidate()
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        self.write_volume(int(round(max(0, min(100, level)) * BT_LEVEL_MAX / 100.0)),
+                          raw[1])
+
+    def step_volume(self, direction, amount):
+        self.invalidate()
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        step = int(round(amount * BT_LEVEL_MAX / 100.0))
+        self.write_volume(raw[0] + (step if direction == 'up' else -step), raw[1])
+
+    def set_mute(self, wanted):
+        self.invalidate()
+        raw = self.raw_volume()
+        if raw is None:
+            return
+        level, muted = raw
+        wanted = (not muted) if wanted is None else wanted
+        if wanted != muted:
+            self.write_volume(level, wanted)
+
+
+class AirPlayBackend(DBusBackend):
+    """AirPlay, driven over shairport-sync's MPRIS interface.
+
+    MPRIS carries all six verbs, `PlayPause` included, so nothing is composed.
+
+    Two measured traps shape this:
+
+    - `systemctl is-active shairport-sync` reads `inactive` the whole time it is
+      playing, and the unit is `disabled`: moOde runs it as a child of php-fpm.
+      Its own `Active` property is the honest sign it is there.
+    - `PlaybackStatus` does NOT follow the sender - it stayed "Playing" across a
+      pause the ALSA substream clearly registered - so it is never read here.
+      `state` keeps coming from the substream, as it already did.
+    """
+
+    flag = 'aplactive'
+    label = 'AirPlay'
+
+    VERBS = {'play': 'Play', 'pause': 'Pause', 'toggle': 'PlayPause',
+             'stop': 'Stop', 'next': 'Next', 'previous': 'Previous'}
+
+    def player_props(self):
+        return self.props(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER)
+
+    def reachable(self):
+        # shairport's own Active, not MPRIS CanControl: CanControl stays true
+        # with no session at all, and not the systemd unit either, which reads
+        # inactive the whole time moOde runs it under php-fpm. A second round
+        # trip, because the two live on different interfaces.
+        return bool(self.props(SHAIRPORT_NAME, SHAIRPORT_PATH,
+                               SHAIRPORT_IFACE).get('Active'))
+
+    def volume_usable(self, cfg_rows):
+        return 'Volume' in self.player_props()
+
+    def mute_usable(self, cfg_rows):
+        # MPRIS has no mute, and shairport's own `mutetoggle` reports nothing
+        # back. A switch has to show a state; this one would be guessing.
+        return False
+
+    def __init__(self):
+        super().__init__()
+        # What we last asked for, and what Volume read at that moment.
+        #
+        # Volume does not follow a command. Measured with a signal subscription:
+        # PropertiesChanged fires only when the NEXT command arrives, and then
+        # carries the PREVIOUS one's level - so the delay is not this bridge
+        # polling too slowly, the value simply does not exist yet. Between two
+        # commands the property is therefore known to be stale, and what was
+        # asked for is the better answer. It is handed back as soon as it moves.
+        #
+        # Whether that is shairport-sync or the sender is not established: the
+        # volume belongs to the sender, and this was measured against one sender
+        # only (the OwnTone bench, for want of an Apple device).
+        self.requested = None
+
+    def volume_state(self):
+        vol = self.player_props().get('Volume')
+        if vol is None:
+            return None
+        # MPRIS works in 0.0-1.0.
+        level = int(round(float(vol) * 100))
+        if self.requested is not None:
+            if level != self.requested:
+                # The property has not caught up yet. Report what was asked for:
+                # the command applies at once, it is only the feedback that is a
+                # step behind, so this number is the true one meanwhile.
+                return self.requested, False, 'renderer'
+            # Caught up. Hand the property back the job - it, not us, knows what
+            # the sender finally did.
+            self.requested = None
+        return level, False, 'renderer'
+
+    def transport(self, verb):
+        self.invalidate()
+        dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, self.VERBS[verb])
+
+    def set_volume(self, level):
+        level = max(0, min(100, level))
+        if dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
+                     dbus.Double(level / 100.0)):
+            self.requested = level
+            self.invalidate()
+
+    def step_volume(self, direction, amount):
+        base = self.requested
+        if base is None:
+            state = self.volume_state()
+            if state is None:
+                return
+            base = state[0]
+        self.set_volume(base + (amount if direction == 'up' else -amount))
+
+
 # The bridge
 
 
@@ -430,6 +1032,17 @@ class Bridge:
         self.update_checked_at = 0.0
         self.release = moode_release()
         self.status_cli = musicpd.MPDClient()
+
+        # Every source the bridge can drive, keyed by the flag it serves.
+        self.backends = {b.flag: b for b in (MoodeBackend(), PibuzBackend(),
+                                             BluezBackend(), AirPlayBackend())}
+        # Whatever is playing now. The publisher thread sets it, the MQTT thread
+        # reads it, so a command can land on a source that stopped less than a
+        # cycle ago - true before backends existed as well.
+        self.backend = self.backends[None]
+        self.source_label = 'moOde'
+        self.volume_ok = False
+        self.mute_ok = False
 
         client_args = {'client_id': cfg['client_id']}
         try:
@@ -454,6 +1067,20 @@ class Bridge:
         self.web_base = ('http://%s' % ip) if ip else \
                         ('http://%s.local' % socket.gethostname())
         log('artwork base URL: %s (detected)' % self.web_base)
+
+    def backend_for(self, active_flag, renderer_active):
+        """The backend driving what is playing, or None when nothing drives it.
+
+        renderer_active is wider than active_flag: a multiroom receiver (rxactive)
+        raises no renderer flag yet still owns the output, so keying on the flag
+        alone would hand it moOde's backend and offer controls that move the wrong
+        player.
+        """
+        if not renderer_active:
+            return self.backends[None]
+        # active_flag is None for a multiroom receiver: look up nothing, or the
+        # None key would hand back moOde's own backend.
+        return self.backends.get(active_flag) if active_flag else None
 
     def topic(self, suffix):
         return '%s/%s' % (self.base, suffix)
@@ -502,47 +1129,66 @@ class Bridge:
         self.wake.set()
 
     # Commands
+    #
+    # Parsing the payload is the bridge's job; acting on it is the backend's. A
+    # source with no backend is refused out loud instead of being sent to
+    # whatever else happens to listen.
+
+    def for_command(self, what):
+        backend = self.backend
+        if backend is None:
+            log('%s ignored: %s has no backend' % (what, self.source_label))
+            return None
+        return backend
 
     def cmd_volume(self, payload):
         parts = payload.split()
-        step = self.cfg['volume_step']
-
         if not parts:
             return
+
+        backend = self.for_command('volume command')
+        if backend is None:
+            return
+        if not self.volume_ok:
+            log('volume command ignored: no volume to move on %s' % backend.label)
+            return
+
         if parts[0] in ('up', 'dn', 'down'):
-            direction = '-up' if parts[0] == 'up' else '-dn'
-            amount = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else step
-            moode_api('set_volume %s %d' % (direction, amount))
+            amount = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() \
+                else self.cfg['volume_step']
+            backend.step_volume('up' if parts[0] == 'up' else 'dn', amount)
         elif parts[0].isdigit():
-            moode_api('set_volume %s' % parts[0])
+            backend.set_volume(int(parts[0]))
         else:
             log('unknown volume payload: %r' % payload)
 
     def cmd_mute(self, payload):
-        """set_volume -mute is a TOGGLE, so honour an explicit on/off request."""
         wanted = payload.lower()
-        current = moode_api('get_volume') or {}
-        muted = current.get('muted') == 'yes'
+        if wanted in ('on', 'true', '1', 'mute'):
+            state = True
+        elif wanted in ('off', 'false', '0', 'unmute'):
+            state = False
+        else:
+            state = None                              # anything else toggles
 
-        if wanted in ('on', 'true', '1', 'mute') and muted:
+        backend = self.for_command('mute command')
+        if backend is None:
             return
-        if wanted in ('off', 'false', '0', 'unmute') and not muted:
+        if not self.mute_ok:
+            log('mute command ignored: %s has no mute to read' % backend.label)
             return
-        moode_api('set_volume -mute')
+        backend.set_mute(state)
 
     def cmd_transport(self, payload):
-        cmd = payload.lower()
-        if cmd not in TRANSPORT_CMDS:
+        verb = payload.lower()
+        verb = TRANSPORT_ALIASES.get(verb, verb)
+        if verb not in TRANSPORT_VERBS:
             log('unknown transport payload: %r' % payload)
             return
 
-        if cmd == 'toggle':
-            # moOde already knows to stop a radio and pause anything else
-            moode_api('toggle_play_pause')
-        elif cmd == 'prev':
-            moode_api('previous')
-        else:
-            moode_api(cmd)
+        backend = self.for_command('transport %r' % verb)
+        if backend is not None:
+            backend.transport(verb)
 
     # State collection and publishing
 
@@ -559,10 +1205,13 @@ class Bridge:
                             'local_display', 'peppy_display', 'rxactive',
                             'audioin'])
 
+        if self.backend is not None:
+            # One snapshot per cycle: see DBusBackend.
+            self.backend.invalidate()
+
         active_flag = next((f for f in RENDERER_FLAGS if cfg_rows.get(f) == '1'), None)
         renderer_active = active_flag is not None or cfg_rows.get('rxactive') == '1'
-        hw = read_hw_params(cfg_rows)
-        card_open = hw is not None
+        card_open = output_is_open(cfg_rows)
 
         # Audio on is immediate; audio off has to survive audio_off_delay, because
         # MPD closes the ALSA device between tracks (touchmon.php does the same
@@ -579,21 +1228,29 @@ class Bridge:
 
         self.publish('audio', 'ON' if self.audio_state else 'OFF')
 
-        # Withdraw the controls in Home Assistant rather than letting them move
-        # something they do not reach. moOde does the same: its renderer
-        # indicator covers the playback screen entirely.
+        # Pick the backend for whatever is playing, and let Home Assistant offer
+        # exactly what that backend can do. A source with no backend keeps its
+        # controls withdrawn rather than letting a button move something it does
+        # not reach - moOde does the same, its renderer indicator covers the
+        # playback screen entirely.
         #
-        # Transport: a renderer plays while MPD is stopped, so these reach MPD
-        # and not what is heard.
+        # Transport: a renderer plays while MPD is stopped, so moOde's own
+        # commands would reach MPD and not what is heard.
         # Volume: the renderer sets its own level from its app, and on a
         # hardware mixer raising the DAC to compensate would stay raised once
         # MPD takes the output back - loud. Also withdrawn on a fixed 0dB
-        # output, where vol.sh changes nothing at all.
-        scope_now = volume_scope(cfg_rows)
+        # output, where moOde's volume changes nothing at all.
+        self.backend = self.backend_for(active_flag, renderer_active)
+        self.source_label = (dict(RENDERER_LABELS).get(active_flag, 'the renderer')
+                             if renderer_active else 'moOde')
+
         self.check_for_update()
-        self.publish('controls/available', 'offline' if renderer_active else 'online')
-        volume_usable = scope_now != 'none' and not renderer_active
-        self.publish('volume/available', 'online' if volume_usable else 'offline')
+        usable = self.backend is not None and self.backend.reachable()
+        self.volume_ok = usable and self.backend.volume_usable(cfg_rows)
+        self.mute_ok = usable and self.backend.mute_usable(cfg_rows)
+        self.publish('controls/available', 'online' if usable else 'offline')
+        self.publish('volume/available', 'online' if self.volume_ok else 'offline')
+        self.publish('mute/available', 'online' if self.mute_ok else 'offline')
 
         if cfg_rows.get('peppy_display') == '1':
             app = 'peppy'
@@ -603,13 +1260,18 @@ class Bridge:
             app = 'none'
         self.publish('display/app', app)
 
-        now = time.monotonic()
-        if (self.display_power_state != 'unknown'
-                or now - self.display_power_checked_at >= DISPLAY_RECHECK_HEADLESS):
-            self.display_power_state = display_power()
-            self.display_power_checked_at = now
-        # Headless box: publish nothing rather than inventing an OFF. The HA
-        # entity then stays "unknown", which is the truth - there is no screen.
+        # No display configured means moOde started no X server, so there is
+        # nothing to ask. Its own worker gates the same call the same way, and
+        # both flags are already in hand for display/app above.
+        if cfg_rows.get('local_display') == '1' or cfg_rows.get('peppy_display') == '1':
+            now = time.monotonic()
+            if now - self.display_power_checked_at >= DISPLAY_RECHECK:
+                self.display_power_state = display_power()
+                self.display_power_checked_at = now
+        else:
+            self.display_power_state = 'unknown'
+        # Publish nothing rather than inventing an OFF: the HA entity then stays
+        # "unknown", which is the truth - there is no screen to report on.
         if self.display_power_state != 'unknown':
             self.publish('display/power',
                          'ON' if self.display_power_state == 'on' else 'OFF')
@@ -632,8 +1294,21 @@ class Bridge:
         # A renderer holds the device and MPD is stopped: its currentsong and its
         # state both describe the track from before. Take the metadata from the
         # renderer's own cache, and the play state from the device being open.
-        meta = read_renderer_meta(active_flag) if active_flag else {}
-        scope = volume_scope(cfg_rows)
+        # The backend first, where it knows better than moOde's cache - or where
+        # moOde keeps none at all, which is Bluetooth's case.
+        meta = self.backend.metadata() if self.backend else None
+        if meta is None:
+            meta = read_renderer_meta(active_flag) if active_flag else {}
+        # The backend driving the sound owns the level it reports. Without this
+        # the number in Home Assistant would come from MPD while the slider
+        # beside it moved a renderer.
+        vol_state = self.backend.volume_state() if self.backend else None
+        if vol_state is not None:
+            volume, muted, scope = vol_state
+        else:
+            volume = int(cfg_rows.get('volknob') or 0)
+            muted = cfg_rows.get('volmute') == '1'
+            scope = volume_scope(cfg_rows)
         if renderer_active:
             state = 'play' if card_open else 'stop'
         else:
@@ -641,13 +1316,14 @@ class Bridge:
 
         player = {
             'state': state,
-            # The knob, not MPD's own volume: with a hardware mixer MPD does
-            # not carry moOde's level. Always the real value - whether the
-            # control should be *used* right now is carried by its own
-            # availability topic instead.
-            'volume': int(cfg_rows.get('volknob') or 0),
+            # moOde's knob, not MPD's own volume: with a hardware mixer MPD does
+            # not carry moOde's level. While a renderer with a backend plays,
+            # this is that renderer's level instead - see above. Always the real
+            # value; whether the control should be *used* right now is carried
+            # by its own availability topic.
+            'volume': volume,
             'volume_scope': scope,
-            'mute': cfg_rows.get('volmute') == '1',
+            'mute': muted,
             'source': display_source(cfg_rows, is_radio),
             'station': '' if renderer_active else station,
             # Empty rather than invented: one key, one value. No placeholder
@@ -659,16 +1335,24 @@ class Bridge:
                      else song.get('title', '').strip(),
             'album': (meta.get('album') or '').strip() if renderer_active
                      else song.get('album', '').strip(),
-            'quality': format_quality(hw, status),
             'audio': '' if renderer_active else status.get('audio', ''),
-            # What the renderer says it received, e.g. "FLAC 16/44.1 kHz"
+            # What the renderer received, e.g. "FLAC 16/44.1 kHz" - and what came
+            # out of its decoder, e.g. "PCM 24/48 kHz, 2ch". Two different
+            # things, kept apart as moOde's Audio Information does: `quality`
+            # above is a third one again, what the DAC is actually fed.
             'source_format': (meta.get('sformat') or '').strip(),
+            'decoded_format': (meta.get('oformat') or '').strip(),
             'file': '' if renderer_active else song.get('file', ''),
             'cover_url': self.absolute_cover(meta.get('cover_url') or ''),
             # Raw extras: useful in templates, deliberately not exposed as
             # entities since they are absent often enough to blink.
-            'genre': song.get('genre', ''),
-            'date': song.get('date', ''),
+            # Blanked with the rest while a renderer plays: MPD is stopped then,
+            # and its currentsong still describes the track from before. A
+            # renderer that reports a genre fills it, and no renderer reports a
+            # release date at all.
+            'genre': (meta.get('genre') or '').strip() if renderer_active
+                     else song.get('genre', ''),
+            'date': '' if renderer_active else song.get('date', ''),
             'bitrate': int(status.get('bitrate') or 0),
             'is_radio': False if renderer_active else is_radio,
             'elapsed': 0.0 if renderer_active else float(status.get('elapsed') or 0),
@@ -790,12 +1474,16 @@ class Bridge:
             'value_template': '{{ value_json.state }}',
             'icon': 'mdi:play-circle',
         })
+        for platform, object_id in RETIRED_ENTITIES:
+            self.client.publish(
+                '%s/%s/%s/%s/config' % (self.cfg['discovery_prefix'], platform,
+                                        inst, object_id), '', retain=True)
+
         for field, label, icon in (('title', 'Title', 'mdi:music-note'),
                                    ('artist', 'Artist', 'mdi:account-music'),
                                    ('album', 'Album', 'mdi:album'),
                                    ('source', 'Source', 'mdi:import'),
-                                   ('station', 'Station', 'mdi:radio'),
-                                   ('quality', 'Quality', 'mdi:high-definition')):
+                                   ('station', 'Station', 'mdi:radio')):
             announce('sensor', field, {
                 'name': label,
                 'state_topic': player,
@@ -828,7 +1516,9 @@ class Bridge:
             'command_topic': self.topic('cmd/mute'),
             'payload_on': 'on', 'payload_off': 'off',
             'icon': 'mdi:volume-off',
-        }, extra_availability=self.topic('volume/available'))
+            # Its own gate, not the volume's: AirPlay has a level to move and no
+            # mute to read.
+        }, extra_availability=self.topic('mute/available'))
         for cmd, label, icon in (('toggle', 'Play/Pause', 'mdi:play-pause'),
                                  ('play', 'Play', 'mdi:play'),
                                  ('pause', 'Pause', 'mdi:pause'),
