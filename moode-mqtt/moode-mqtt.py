@@ -433,6 +433,13 @@ class Backend:
         """Is the mechanism answering right now? Checked every publish cycle."""
         return True
 
+    def invalidate(self):
+        """Drop anything cached for the current cycle.
+
+        Called once per cycle by the publisher, and by a command before it acts
+        on what it reads. A backend that caches nothing has nothing to do.
+        """
+
     def volume_usable(self, cfg_rows):
         """Can this backend move the volume, given moOde's current config?
 
@@ -530,15 +537,16 @@ def dbus_bus():
     return _SYSTEM_BUS
 
 
-def dbus_prop(service, path, interface, name):
-    """One property, or None if anything at all went wrong.
+def dbus_props_all(service, path, interface):
+    """Every property of one interface in a single round trip, or None.
 
-    A renderer's D-Bus objects come and go with the device, so "not there" is an
-    ordinary answer and not worth a log line on every cycle.
+    Measured: a round trip costs about 2 ms whatever comes back - GetAll over an
+    interface carrying 25 properties timed the same as Get on one of them. So
+    reading properties one at a time buys nothing and costs a round trip each.
     """
     try:
         obj = dbus_bus().get_object(service, path)
-        return dbus.Interface(obj, DBUS_PROPS).Get(interface, name)
+        return dbus.Interface(obj, DBUS_PROPS).GetAll(interface)
     except Exception:
         return None
 
@@ -691,7 +699,36 @@ class PibuzBackend(Backend):
         self.invalidate()
 
 
-class BluezBackend(Backend):
+class DBusBackend(Backend):
+    """A backend that reads its state from D-Bus properties, one snapshot a cycle.
+
+    Every value a cycle publishes then comes from the same instant. Reading
+    property by property did not only cost a round trip each - it also let the
+    parts of one payload drift milliseconds apart, so a track could be reported
+    against a volume read after it changed.
+
+    The publisher clears the snapshot at the top of each cycle; a command clears
+    it too, since it must act on what is true now rather than on what was true
+    up to a second ago.
+    """
+
+    def __init__(self):
+        self.snapshot = {}
+
+    def invalidate(self):
+        self.snapshot = {}
+
+    def props(self, service, path, interface):
+        """One interface's properties, fetched at most once per cycle."""
+        if path is None:
+            return {}
+        key = (service, path, interface)
+        if key not in self.snapshot:
+            self.snapshot[key] = dbus_props_all(service, path, interface) or {}
+        return self.snapshot[key]
+
+
+class BluezBackend(DBusBackend):
     """Bluetooth: AVRCP for transport, BlueALSA for the mixer.
 
     Two services, each owning what it owns. bluez carries the remote-control
@@ -711,6 +748,7 @@ class BluezBackend(Backend):
              'next': 'Next', 'previous': 'Previous'}
 
     def __init__(self):
+        super().__init__()
         self.player = None
         self.pcm = None
 
@@ -718,6 +756,13 @@ class BluezBackend(Backend):
         """Both paths carry the device address, so a disconnect invalidates them."""
         self.player = None
         self.pcm = None
+        self.invalidate()
+
+    def player_props(self):
+        return self.props(BLUEZ, self.player_path(), BLUEZ_PLAYER)
+
+    def pcm_props(self):
+        return self.props(BLUEALSA, self.pcm_path(), BLUEALSA_PCM)
 
     def player_path(self):
         if self.player is None:
@@ -730,10 +775,9 @@ class BluezBackend(Backend):
         return self.pcm
 
     def reachable(self):
-        path = self.player_path()
-        if path is None:
+        if self.player_path() is None:
             return False
-        if dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Status') is None:
+        if 'Status' not in self.player_props():
             self.forget()                  # the device left, the path is stale
             return False
         return True
@@ -747,8 +791,7 @@ class BluezBackend(Backend):
         Kept on BlueALSA's own scale so a mute or a step does not round-trip
         through 0-100 and drift.
         """
-        pcm = self.pcm_path()
-        raw = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Volume') if pcm else None
+        raw = self.pcm_props().get('Volume')
         if raw is None:
             self.pcm = None
             return None
@@ -772,8 +815,7 @@ class BluezBackend(Backend):
         """AVRCP carries what moOde caches for every other renderer and never
         caches for this one - which is why Bluetooth's fields were the only ones
         permanently empty."""
-        path = self.player_path()
-        track = dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Track') if path else None
+        track = self.player_props().get('Track')
         if track is None:
             return None
 
@@ -792,17 +834,17 @@ class BluezBackend(Backend):
         # apart: the codec alone is the source - aptX-HD is lossy and carries no
         # bit depth of its own - while the depth and rate belong to what came
         # out of the decoder. audioinfo.php reads the same two places.
-        pcm = self.pcm_path()
+        pcm = self.pcm_props()
         if pcm:
-            codec = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Codec')
+            codec = pcm.get('Codec')
             if codec:
                 meta['sformat'] = str(codec)
             # PCM1.Format is the numeric form of the name bluealsa-cli prints:
             # S24_LE reads 0x8418, whose low byte is the 24. moOde takes the
             # same figure out of the string.
-            fmt = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Format')
-            rate = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Sampling')
-            channels = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Channels')
+            fmt = pcm.get('Format')
+            rate = pcm.get('Sampling')
+            channels = pcm.get('Channels')
             if fmt and rate:
                 # Shaped like the oformat the other renderers' caches carry, so
                 # one key holds one kind of value whoever filled it.
@@ -811,17 +853,19 @@ class BluezBackend(Backend):
         return meta
 
     def transport(self, verb):
+        self.invalidate()                  # a command acts on the state now
         path = self.player_path()
         if path is None:
             return
         if verb == 'toggle':
             # AVRCP has no toggle, so ask what it is doing before deciding.
-            status = str(dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Status') or '')
+            status = str(self.player_props().get('Status') or '')
             verb = 'pause' if status == 'playing' else 'play'
         if not dbus_call(BLUEZ, path, BLUEZ_PLAYER, self.VERBS[verb]):
             self.forget()
 
     def set_volume(self, level):
+        self.invalidate()
         raw = self.raw_volume()
         if raw is None:
             return
@@ -829,6 +873,7 @@ class BluezBackend(Backend):
                           raw[1])
 
     def step_volume(self, direction, amount):
+        self.invalidate()
         raw = self.raw_volume()
         if raw is None:
             return
@@ -836,6 +881,7 @@ class BluezBackend(Backend):
         self.write_volume(raw[0] + (step if direction == 'up' else -step), raw[1])
 
     def set_mute(self, wanted):
+        self.invalidate()
         raw = self.raw_volume()
         if raw is None:
             return
@@ -845,7 +891,7 @@ class BluezBackend(Backend):
             self.write_volume(level, wanted)
 
 
-class AirPlayBackend(Backend):
+class AirPlayBackend(DBusBackend):
     """AirPlay, driven over shairport-sync's MPRIS interface.
 
     MPRIS carries all six verbs, `PlayPause` included, so nothing is composed.
@@ -866,13 +912,19 @@ class AirPlayBackend(Backend):
     VERBS = {'play': 'Play', 'pause': 'Pause', 'toggle': 'PlayPause',
              'stop': 'Stop', 'next': 'Next', 'previous': 'Previous'}
 
+    def player_props(self):
+        return self.props(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER)
+
     def reachable(self):
-        return bool(dbus_prop(SHAIRPORT_NAME, SHAIRPORT_PATH,
-                              SHAIRPORT_IFACE, 'Active'))
+        # shairport's own Active, not MPRIS CanControl: CanControl stays true
+        # with no session at all, and not the systemd unit either, which reads
+        # inactive the whole time moOde runs it under php-fpm. A second round
+        # trip, because the two live on different interfaces.
+        return bool(self.props(SHAIRPORT_NAME, SHAIRPORT_PATH,
+                               SHAIRPORT_IFACE).get('Active'))
 
     def volume_usable(self, cfg_rows):
-        return dbus_prop(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER,
-                         'Volume') is not None
+        return 'Volume' in self.player_props()
 
     def mute_usable(self, cfg_rows):
         # MPRIS has no mute, and shairport's own `mutetoggle` reports nothing
@@ -880,6 +932,7 @@ class AirPlayBackend(Backend):
         return False
 
     def __init__(self):
+        super().__init__()
         # The level we last asked for, which is NOT what Volume reads back: that
         # property trails by one command, and updates on the next change rather
         # than after any delay (measured over 20 s, twice). A relative step
@@ -888,7 +941,7 @@ class AirPlayBackend(Backend):
         self.requested = None
 
     def volume_state(self):
-        vol = dbus_prop(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'Volume')
+        vol = self.player_props().get('Volume')
         if vol is None:
             return None
         # MPRIS works in 0.0-1.0. This reports where the sender says it is -
@@ -897,6 +950,7 @@ class AirPlayBackend(Backend):
         return int(round(float(vol) * 100)), False, 'renderer'
 
     def transport(self, verb):
+        self.invalidate()
         dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, self.VERBS[verb])
 
     def set_volume(self, level):
@@ -1107,6 +1161,10 @@ class Bridge:
                            ['volknob', 'volmute', 'cardnum', 'multiroom_tx', 'mpdmixer',
                             'local_display', 'peppy_display', 'rxactive',
                             'audioin'])
+
+        if self.backend is not None:
+            # One snapshot per cycle: see DBusBackend.
+            self.backend.invalidate()
 
         active_flag = next((f for f in RENDERER_FLAGS if cfg_rows.get(f) == '1'), None)
         renderer_active = active_flag is not None or cfg_rows.get('rxactive') == '1'
