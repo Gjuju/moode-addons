@@ -834,20 +834,26 @@ class BluezBackend(Backend):
         except (TypeError, ValueError):
             meta['duration'] = 0.0
 
-        # Composed from three measured values, with no bit depth: BlueALSA does
-        # not report one in a form worth decoding, and an invented figure would
-        # be worse than a shorter string.
+        # Source and decoded are two different things, and moOde keeps them
+        # apart: the codec alone is the source - aptX-HD is lossy and carries no
+        # bit depth of its own - while the depth and rate belong to what came
+        # out of the decoder. audioinfo.php reads the same two places.
         pcm = self.pcm_path()
-        codec = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Codec') if pcm else None
-        if codec:
+        if pcm:
+            codec = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Codec')
+            if codec:
+                meta['sformat'] = str(codec)
+            # PCM1.Format is the numeric form of the name bluealsa-cli prints:
+            # S24_LE reads 0x8418, whose low byte is the 24. moOde takes the
+            # same figure out of the string.
+            fmt = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Format')
             rate = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Sampling')
             channels = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Channels')
-            parts = [str(codec)]
-            if rate:
-                parts.append('%g kHz' % (int(rate) / 1000.0))
-            if channels:
-                parts.append('%dch' % int(channels))
-            meta['sformat'] = ' '.join(parts)
+            if fmt and rate:
+                # Shaped like the oformat the other renderers' caches carry, so
+                # one key holds one kind of value whoever filled it.
+                meta['oformat'] = 'PCM %d/%g kHz, %dch' % (
+                    int(fmt) & 0xFF, int(rate) / 1000.0, int(channels or 2))
         return meta
 
     def transport(self, verb):
@@ -1272,8 +1278,12 @@ class Bridge:
                      else song.get('album', '').strip(),
             'quality': format_quality(hw, status),
             'audio': '' if renderer_active else status.get('audio', ''),
-            # What the renderer says it received, e.g. "FLAC 16/44.1 kHz"
+            # What the renderer received, e.g. "FLAC 16/44.1 kHz" - and what came
+            # out of its decoder, e.g. "PCM 24/48 kHz, 2ch". Two different
+            # things, kept apart as moOde's Audio Information does: `quality`
+            # above is a third one again, what the DAC is actually fed.
             'source_format': (meta.get('sformat') or '').strip(),
+            'decoded_format': (meta.get('oformat') or '').strip(),
             'file': '' if renderer_active else song.get('file', ''),
             'cover_url': self.absolute_cover(meta.get('cover_url') or ''),
             # Raw extras: useful in templates, deliberately not exposed as
