@@ -12,9 +12,9 @@ to run alongside this bridge. Three things it cannot do:
 
 - **Volume.** It talks to MPD directly. moOde's level lives in `cfg_system.volknob`
   and, when `mpdmixer` is *hardware*, MPD does not carry it at all — so the WebUI
-  knob goes stale. This bridge routes every volume change through
-  `/var/www/util/vol.sh`, which owns `volknob`, `volmute` and the amixer-vs-mpc
-  choice.
+  knob goes stale. This bridge routes every volume change through moOde's own
+  REST API, which owns `volknob`, `volmute`, the amixer-vs-mpc choice and the
+  propagation to multiroom receivers.
 - **Non-MPD sources.** AirPlay, Spotify Connect, Qobuz, Bluetooth and line-in
   never touch MPD. This bridge reads the ALSA substream instead, so they count.
 - **The local display.** Not visible to MPD at all.
@@ -40,15 +40,16 @@ sudo ./install.sh
 ```
 
 The installer pulls `python3-paho-mqtt` and `python3-musicpd` from apt, installs
-the daemon and its systemd unit, then checks the three things that can silently
-be wrong: a wrong password leaves the service `active` and mute, and a failed
-`enable` leaves it working until the next reboot. Expect:
+the daemon and its systemd unit, then checks the things that can silently be
+wrong: a wrong password leaves the service `active` and mute, a failed `enable`
+leaves it working until the next reboot, and an unreachable REST API leaves it
+publishing state while accepting no command at all. Expect:
 
 ```
 [ok] service is running
 [ok] enabled at boot
 [ok] connected to the broker
-[ok] vol.sh present
+[ok] moOde REST API answers
 ```
 
 The entities appear in Home Assistant on their own, under a device named after
@@ -58,18 +59,40 @@ To update later: `git pull` in that directory, then `sudo ./install.sh` again.
 It is re-runnable and only restarts what changed; your `moode-mqtt.conf` is
 never overwritten.
 
-**What to fill in.** Only the first block usually matters:
+**What to fill in.** The sample is commented throughout; these are the only keys
+that usually need a look, quoted exactly as it carries them:
 
 ```ini
 [broker]
 host = 192.168.1.x
-username =                  # leave empty for an anonymous broker
+port = 1883
+username =
 password =
+client_id = moode-mqtt
 
 [moode]
-instance = moode            # topic prefix and HA device id - pick it once
-friendly_name = moOde       # the name shown in Home Assistant
+instance = moode
+friendly_name = moOde
 ```
+
+- `host`, `port` — your broker. Leave `username` and `password` empty for an
+  anonymous one.
+- `client_id` — **must differ between boxes.** MQTT allows one connection per
+  client id, so two boxes sharing one kick each other off forever. See
+  [More than one box](#more-than-one-box).
+- `instance` — the topic prefix *and* the Home Assistant device id. Changing it
+  later creates a second device in HA, so pick it once.
+- `friendly_name` — the name shown in Home Assistant.
+
+**No comments at the end of a value line.** The daemon reads the file with
+Python's `ConfigParser`, which does not strip them: `username = bob  # my broker`
+gives a username of `bob  # my broker`. That is deliberate rather than an
+oversight — enabling inline comments would truncate any password containing a
+`#`, and passwords do. Put comments on their own line, as the sample does.
+
+Everything below those keys has a working default and its own comment in the
+file: poll interval, the audio-off debounce, the volume step, the artwork base
+URL and the update check.
 
 `moode-mqtt.conf` is **gitignored** — only `moode-mqtt.conf.sample` is
 committed, so a `git pull` never touches your credentials.
@@ -238,8 +261,12 @@ reports:
 | `volume_scope` | the knob drives | while a renderer plays |
 |---|---|---|
 | `hardware` | the card's ALSA mixer, downstream of everything | applies, and the published level is exact |
-| `mpd` | `mpc volume`, MPD alone | **controls nothing audible**; `volume` is published as null |
-| `none` | nothing — Fixed 0dB, `vol.sh` exits immediately | always null |
+| `mpd` | `mpc volume`, MPD alone | **controls nothing audible** |
+| `none` | nothing — Fixed 0dB, the volume command exits immediately | nothing, ever |
+
+`volume` always carries the real knob value, whatever the scope. It is never
+published as null or omitted: whether the control should be *used* right now is
+carried by `volume/available`, not by a hole in the payload.
 
 So **every control is published as unavailable while a renderer plays** — the
 six transport buttons, the volume and the mute. Each lists its gate alongside
@@ -270,7 +297,7 @@ own level belongs to its app.
 of moOde's state; only the *control* is withdrawn.
 
 moOde's own ceiling still applies to everything this bridge does, because all
-volume goes through `vol.sh`: set **Configure → Audio → Max volume**
+volume goes through moOde: set **Configure → Audio → Max volume**
 (`volume_mpd_max`) and neither the WebUI nor Home Assistant can exceed it. That
 is a moOde setting, not something this bridge duplicates.
 
@@ -451,7 +478,7 @@ Assistant:
   moOde's own worker runs from `rc.local` as root there, which this service is
   independent of.
 - `/var/local/www/db/moode-sqlite3.db` is owned by `www-data` on the Pi exactly
-  as on x86, so `vol.sh` works from a `www-data` daemon. This was the one thing
+  as on x86, so the daemon reads it as `www-data`. This was the one thing
   that could have forced a different user, and it does not.
 - `www-data ALL=(ALL) NOPASSWD: ALL` is present on stock moOde too.
 - `python3-musicpd` is already installed; `python3-paho-mqtt` (2.1.0) comes from
@@ -531,7 +558,7 @@ immediately.
 
 **No writes to `cfg_system`.** The database is opened read-only. Writing it
 behind moOde's back desyncs its PHP session cache, and the WebUI then looks
-stuck. Every change goes through `vol.sh` or `mpc`.
+stuck. Every change goes through moOde's REST API.
 
 **Runs as `www-data`**, the web server user — the sqlite DB is owned by
 `www-data`, so a root daemon would leave root-owned journal files behind.
