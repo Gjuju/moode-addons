@@ -498,6 +498,16 @@ class Backend:
         """
         return self.volume_usable(cfg_rows)
 
+    def metadata(self):
+        """Track information from the source itself, shaped like moOde's caches
+        (artist, title, album, genre, duration in seconds, sformat, cover_url),
+        or None to fall back to the cache.
+
+        None is the right answer wherever moOde already caches the renderer: that
+        file is written by the renderer itself and costs a read to use.
+        """
+        return None
+
     def volume_state(self):
         """(level 0-100, muted, scope) as this backend sees it, or None.
 
@@ -803,6 +813,42 @@ class BluezBackend(Backend):
             return None
         level, muted = raw
         return int(round(level * 100.0 / BT_LEVEL_MAX)), muted, 'renderer'
+
+    def metadata(self):
+        """AVRCP carries what moOde caches for every other renderer and never
+        caches for this one - which is why Bluetooth's fields were the only ones
+        permanently empty."""
+        path = self.player_path()
+        track = dbus_prop(BLUEZ, path, BLUEZ_PLAYER, 'Track') if path else None
+        if track is None:
+            return None
+
+        def text(key):
+            return str(track.get(key, '')).strip()
+
+        meta = {'artist': text('Artist'), 'title': text('Title'),
+                'album': text('Album'), 'genre': text('Genre')}
+        try:
+            # AVRCP reports milliseconds, as AirPlay and Spotify's caches do.
+            meta['duration'] = float(track.get('Duration', 0)) / 1000.0
+        except (TypeError, ValueError):
+            meta['duration'] = 0.0
+
+        # Composed from three measured values, with no bit depth: BlueALSA does
+        # not report one in a form worth decoding, and an invented figure would
+        # be worse than a shorter string.
+        pcm = self.pcm_path()
+        codec = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Codec') if pcm else None
+        if codec:
+            rate = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Sampling')
+            channels = dbus_prop(BLUEALSA, pcm, BLUEALSA_PCM, 'Channels')
+            parts = [str(codec)]
+            if rate:
+                parts.append('%g kHz' % (int(rate) / 1000.0))
+            if channels:
+                parts.append('%dch' % int(channels))
+            meta['sformat'] = ' '.join(parts)
+        return meta
 
     def transport(self, verb):
         path = self.player_path()
@@ -1183,7 +1229,11 @@ class Bridge:
         # A renderer holds the device and MPD is stopped: its currentsong and its
         # state both describe the track from before. Take the metadata from the
         # renderer's own cache, and the play state from the device being open.
-        meta = read_renderer_meta(active_flag) if active_flag else {}
+        # The backend first, where it knows better than moOde's cache - or where
+        # moOde keeps none at all, which is Bluetooth's case.
+        meta = self.backend.metadata() if self.backend else None
+        if meta is None:
+            meta = read_renderer_meta(active_flag) if active_flag else {}
         # The backend driving the sound owns the level it reports. Without this
         # the number in Home Assistant would come from MPD while the slider
         # beside it moved a renderer.
@@ -1228,8 +1278,13 @@ class Bridge:
             'cover_url': self.absolute_cover(meta.get('cover_url') or ''),
             # Raw extras: useful in templates, deliberately not exposed as
             # entities since they are absent often enough to blink.
-            'genre': song.get('genre', ''),
-            'date': song.get('date', ''),
+            # Blanked with the rest while a renderer plays: MPD is stopped then,
+            # and its currentsong still describes the track from before. A
+            # renderer that reports a genre fills it, and no renderer reports a
+            # release date at all.
+            'genre': (meta.get('genre') or '').strip() if renderer_active
+                     else song.get('genre', ''),
+            'date': '' if renderer_active else song.get('date', ''),
             'bitrate': int(status.get('bitrate') or 0),
             'is_radio': False if renderer_active else is_radio,
             'elapsed': 0.0 if renderer_active else float(status.get('elapsed') or 0),
