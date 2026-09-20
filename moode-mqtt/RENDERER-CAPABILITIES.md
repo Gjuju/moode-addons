@@ -158,16 +158,17 @@ on both sides — so this is one control, not two.
 
 | what | where |
 |---|---|
-| **metadata** | `Track` — Title, Artist, Album, Genre, Duration (ms), TrackNumber |
-| position | `Position`, in ms |
-| **codec** | `org.bluealsa.PCM1.Codec` — `aptX-HD` here |
-| sampling, channels, running | same interface |
+| position | `Position`, in ms — `elapsed` is still 0 for every renderer |
+| TrackNumber, NumberOfTracks | `Track` |
+| `Running` | `org.bluealsa.PCM1` |
 | the app playing on the phone | `Name` = `Qobuz` |
 
-The first three close gaps this bridge documents as empty: Bluetooth is the one
-renderer moOde keeps **no metadata cache** for, so `artist` / `title` / `album`
-and `source_format` are blank. AVRCP has all of them, and the backend is already
-connected to the very interfaces that carry them.
+There is **no artwork in AVRCP at all**, so `cover_url` stays empty for
+Bluetooth rather than borrowing one from somewhere else.
+
+Two measured caveats on the metadata: a track with no `Genre` key leaves that
+field empty, and the phone's app decides what `Duration` means — one reported
+60 s for a stream. The bridge passes on what it was told.
 
 Measured behaviour worth carrying into the backend:
 
