@@ -960,20 +960,37 @@ class AirPlayBackend(DBusBackend):
 
     def __init__(self):
         super().__init__()
-        # The level we last asked for, which is NOT what Volume reads back: that
-        # property trails by one command, and updates on the next change rather
-        # than after any delay (measured over 20 s, twice). A relative step
-        # computed from it would be wrong, not merely late - asked to go up from
-        # a real 45 it read 25 and aimed at 35.
+        # What we last asked for, and what Volume read at that moment.
+        #
+        # Volume does not follow a command. Measured with a signal subscription:
+        # PropertiesChanged fires only when the NEXT command arrives, and then
+        # carries the PREVIOUS one's level - so the delay is not this bridge
+        # polling too slowly, the value simply does not exist yet. Between two
+        # commands the property is therefore known to be stale, and what was
+        # asked for is the better answer. It is handed back as soon as it moves.
+        #
+        # Whether that is shairport-sync or the sender is not established: the
+        # volume belongs to the sender, and this was measured against one sender
+        # only (the OwnTone bench, for want of an Apple device).
         self.requested = None
+        self.reported_at_request = None
 
     def volume_state(self):
         vol = self.player_props().get('Volume')
         if vol is None:
             return None
-        # MPRIS works in 0.0-1.0. This reports where the sender says it is -
-        # never what was asked for - so it stays true even though it is late,
-        # and even though the sender may clamp to a ceiling of its own.
+        if self.requested is not None:
+            stale = (self.reported_at_request is not None
+                     and abs(float(vol) - self.reported_at_request) < 0.001)
+            if stale:
+                # Still the pre-command value: report what was asked instead of
+                # a number known to be out of date.
+                return self.requested, False, 'renderer'
+            # It moved, so it is current again - and it wins over what we asked,
+            # since the sender may have clamped it.
+            self.requested = None
+            self.reported_at_request = None
+        # MPRIS works in 0.0-1.0.
         return int(round(float(vol) * 100)), False, 'renderer'
 
     def transport(self, verb):
@@ -982,9 +999,13 @@ class AirPlayBackend(DBusBackend):
 
     def set_volume(self, level):
         level = max(0, min(100, level))
+        self.invalidate()
+        current = self.player_props().get('Volume')
         if dbus_call(MPRIS_NAME, MPRIS_PATH, MPRIS_PLAYER, 'SetVolume',
                      dbus.Double(level / 100.0)):
             self.requested = level
+            self.reported_at_request = (float(current) if current is not None
+                                        else None)
 
     def step_volume(self, direction, amount):
         base = self.requested
