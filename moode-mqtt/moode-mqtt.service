@@ -10,12 +10,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# www-data, the web server user: vol.sh writes cfg_system and the DB is owned by
-# www-data, so running as root would leave root-owned sqlite journal files
-# behind. www-data has NOPASSWD sudo in moOde, which is what `xset q` needs.
+# www-data, the web server user: the sqlite DB is owned by www-data, so running
+# as root would leave root-owned journal files behind. Nothing the bridge does
+# needs privilege - not even reading the screen state.
 User=www-data
 Group=www-data
-ExecStart=/usr/local/bin/moode-mqtt.py
+ExecStart=/usr/local/lib/moode-mqtt/moode-mqtt.py
 Restart=always
 RestartSec=5
 
