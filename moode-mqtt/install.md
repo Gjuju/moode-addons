@@ -584,11 +584,12 @@ Assistant:
 - `python3-musicpd` and `python3-dbus` are already installed; `python3-paho-mqtt` (2.1.0) comes from
   apt via `install.sh`.
 
-**Headless boxes**: with no Xorg running, `xset q` answers nothing and the
-bridge publishes **nothing** on `display/power` rather than a made-up `OFF` —
-the HA entity stays `unknown`, which is the truth. `display/app` still reports
-`none`, which is accurate: no app is on screen. Verified on two boxes with no X
-at all.
+**Headless boxes**: the bridge does not even ask. moOde starts an X server only
+where a display is configured, and its own worker gates the same call behind the
+same two flags — so with `local_display` and `peppy_display` both off there is
+nothing to fork. It publishes **nothing** on `display/power` rather than a
+made-up `OFF`, the HA entity stays `unknown`, and `display/app` reports `none`,
+which is accurate: no app is on screen. Verified on two boxes with no X at all.
 
 **Why the screen state is on a timer.** Asking X costs a fork, and that made it
 by far the most expensive thing the bridge did — 6.3 ms of CPU on a Pi 3 against

@@ -180,7 +180,8 @@ VERSION_URL = ('https://raw.githubusercontent.com/Gjuju/moode-addons'
 UPDATE_CHECK_INTERVAL = 12 * 3600
 
 # Reading the screen state costs a fork, which makes it by far the most
-# expensive thing in a cycle - so it runs on a timer rather than every time.
+# expensive thing in a cycle - so it runs on a timer, and only where moOde
+# configured a display at all.
 # Measured on an x86 box with a touch panel: 26 ms of CPU per call through sudo,
 # against 3.7 ms for everything else the cycle does put together. The sensor it
 # feeds is informational, and deliberately not the amp signal: that is `audio`,
@@ -1233,12 +1234,18 @@ class Bridge:
             app = 'none'
         self.publish('display/app', app)
 
-        now = time.monotonic()
-        if now - self.display_power_checked_at >= DISPLAY_RECHECK:
-            self.display_power_state = display_power()
-            self.display_power_checked_at = now
-        # Headless box: publish nothing rather than inventing an OFF. The HA
-        # entity then stays "unknown", which is the truth - there is no screen.
+        # No display configured means moOde started no X server, so there is
+        # nothing to ask. Its own worker gates the same call the same way, and
+        # both flags are already in hand for display/app above.
+        if cfg_rows.get('local_display') == '1' or cfg_rows.get('peppy_display') == '1':
+            now = time.monotonic()
+            if now - self.display_power_checked_at >= DISPLAY_RECHECK:
+                self.display_power_state = display_power()
+                self.display_power_checked_at = now
+        else:
+            self.display_power_state = 'unknown'
+        # Publish nothing rather than inventing an OFF: the HA entity then stays
+        # "unknown", which is the truth - there is no screen to report on.
         if self.display_power_state != 'unknown':
             self.publish('display/power',
                          'ON' if self.display_power_state == 'on' else 'OFF')
