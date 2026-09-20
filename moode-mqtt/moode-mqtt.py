@@ -103,51 +103,6 @@ def volume_scope(cfg_rows):
     return 'hardware' if mixer == 'hardware' else 'mpd'
 
 
-def format_quality(params, status=None):
-    """Readable output format from ALSA hw_params.
-
-    Preferred over MPD's status 'audio' because MPD reports nothing at all while
-    a renderer holds the device, and this is the real thing anyway: resampling
-    and CamillaDSP included.
-
-    The format designators handled here mirror moOde's own parser in
-    inc/alsa.php (getAlsaHwParams) - keep the two in step.
-    """
-    if not params:
-        return ''
-    fmt = params.get('format', '')
-    rate = (params.get('rate', '') or '').split(' ')[0]
-    if not fmt or not rate.isdigit():
-        return ''
-
-    khz_only = '%g kHz' % (int(rate) / 1000)
-
-    # S/PDIF carries its samples in a subframe whose name says nothing about the
-    # depth, so the digits in it are not a bit count. MPD knows the real depth
-    # when it is the one playing; nothing does otherwise, so report the rate
-    # alone rather than inventing a number.
-    if fmt == 'IEC958_SUBFRAME_LE':
-        mpd_bits = ((status or {}).get('audio') or '').split(':')
-        if len(mpd_bits) > 1 and mpd_bits[1].isdigit():
-            return '%s bit / %s' % (mpd_bits[1], khz_only)
-        return khz_only
-
-    head = fmt.split('_')[0]                       # S32, S24, FLOAT, DSD
-    if fmt.startswith('DSD'):
-        # DSD_U32_BE at 88200 carries 32 bits per frame: 88200 x 32 = DSD64.
-        carrier = ''.join(c for c in fmt.split('_')[1] if c.isdigit()) or '8'
-        multiple = int(rate) * int(carrier) / 44100
-        if multiple == int(multiple):
-            return 'DSD%d' % multiple
-        return 'DSD %g kHz' % (int(rate) / 1000)
-
-    khz = '%g' % (int(rate) / 1000)
-    bits = ''.join(c for c in head if c.isdigit())
-    if bits:
-        return '%s bit / %s kHz' % (bits, khz)
-    return '%s / %s kHz' % (head.lower(), khz)
-
-
 def local_address(host, port):
     """This box's address as seen from the broker.
 
@@ -257,6 +212,12 @@ RENDERER_META_FILES = {
 TRANSPORT_VERBS = ('play', 'pause', 'toggle', 'stop', 'next', 'previous')
 TRANSPORT_ALIASES = {'prev': 'previous'}
 
+# Entities this bridge used to announce. Removing one from the code is not
+# enough: its discovery config was published retained, so Home Assistant keeps
+# showing it until an empty payload replaces it. Drop an entry once every install
+# has run a version that retired it.
+RETIRED_ENTITIES = (('sensor', 'quality'),)
+
 # pibuz (Qobuz Connect) control API. Unauthenticated by its own default, and
 # reachable by www-data - both measured, not assumed.
 DBUS_PROPS = 'org.freedesktop.DBus.Properties'
@@ -355,12 +316,13 @@ def db_read(params):
         return {}
 
 
-def read_hw_params(cfg_rows):
-    """Parsed ALSA hw_params of the output substream, or None when it is closed.
+def output_is_open(cfg_rows):
+    """Is the output substream open - by anyone: MPD, AirPlay, Qobuz, Bluetooth.
 
-    This is the one place that knows what the DAC is actually being fed, whoever
-    opened it - MPD, AirPlay, Qobuz, Bluetooth. Mirrors moodeutl --hwparams: in
-    multiroom transmitter mode the real output is the ALSA Loopback.
+    The one signal that does not depend on who is playing, which is why "audio
+    active" and a renderer's play state both come from here rather than from MPD.
+    Mirrors moodeutl --hwparams: in multiroom transmitter mode the real output is
+    the ALSA Loopback.
     """
     if cfg_rows.get('multiroom_tx') == 'On':
         try:
@@ -368,7 +330,7 @@ def read_hw_params(cfg_rows):
                 card = next(line.split(': ')[1].strip()
                             for line in fh if line.startswith('card'))
         except (OSError, StopIteration):
-            return None
+            return False
     else:
         card = cfg_rows.get('cardnum', '0')
 
@@ -376,18 +338,10 @@ def read_hw_params(cfg_rows):
         with open('/proc/asound/card%s/pcm0p/sub0/hw_params' % card) as fh:
             text = fh.read().strip()
     except OSError:
-        return None
+        return False
     # moOde's own parser treats both of these as "nothing playing" (inc/alsa.php,
     # getAlsaHwParams).
-    if not text or text in ('closed', 'no setup'):
-        return None
-
-    params = {}
-    for line in text.splitlines():
-        if ':' in line:
-            key, value = line.split(':', 1)
-            params[key.strip()] = value.strip()
-    return params
+    return bool(text) and text not in ('closed', 'no setup')
 
 
 def display_power():
@@ -1156,8 +1110,7 @@ class Bridge:
 
         active_flag = next((f for f in RENDERER_FLAGS if cfg_rows.get(f) == '1'), None)
         renderer_active = active_flag is not None or cfg_rows.get('rxactive') == '1'
-        hw = read_hw_params(cfg_rows)
-        card_open = hw is not None
+        card_open = output_is_open(cfg_rows)
 
         # Audio on is immediate; audio off has to survive audio_off_delay, because
         # MPD closes the ALSA device between tracks (touchmon.php does the same
@@ -1276,7 +1229,6 @@ class Bridge:
                      else song.get('title', '').strip(),
             'album': (meta.get('album') or '').strip() if renderer_active
                      else song.get('album', '').strip(),
-            'quality': format_quality(hw, status),
             'audio': '' if renderer_active else status.get('audio', ''),
             # What the renderer received, e.g. "FLAC 16/44.1 kHz" - and what came
             # out of its decoder, e.g. "PCM 24/48 kHz, 2ch". Two different
@@ -1416,12 +1368,16 @@ class Bridge:
             'value_template': '{{ value_json.state }}',
             'icon': 'mdi:play-circle',
         })
+        for platform, object_id in RETIRED_ENTITIES:
+            self.client.publish(
+                '%s/%s/%s/%s/config' % (self.cfg['discovery_prefix'], platform,
+                                        inst, object_id), '', retain=True)
+
         for field, label, icon in (('title', 'Title', 'mdi:music-note'),
                                    ('artist', 'Artist', 'mdi:account-music'),
                                    ('album', 'Album', 'mdi:album'),
                                    ('source', 'Source', 'mdi:import'),
-                                   ('station', 'Station', 'mdi:radio'),
-                                   ('quality', 'Quality', 'mdi:high-definition')):
+                                   ('station', 'Station', 'mdi:radio')):
             announce('sensor', field, {
                 'name': label,
                 'state_topic': player,

@@ -140,7 +140,7 @@ look once at what comes out rather than reinstalling:
 mosquitto_sub -h <broker> -u <user> -P <pass> -t 'moode/<id>/player' -C 1
 ```
 
-Play a local file and a radio station, and check `source`, `quality`, `artist`
+Play a local file and a radio station, and check `source`, `artist`
 and `title` against what moOde's own WebUI shows. Two minutes, and it covers
 exactly what could have drifted. The duplicated spots each carry a pointer to
 their original in moOde's source — see *Why not call moOde's own code*.
@@ -206,7 +206,6 @@ on change only**.
 | `artist`, `title`, `album` | **exactly what the source reports, or empty** |
 | `station` | stream `Name`, empty off a radio |
 | `source` | `Radio`, `Library`, or the active renderer |
-| `quality` | `24 bit / 96 kHz`, `DSD64` — from ALSA, so every source |
 | `source_format` | what a renderer received: `Vorbis 320 kbps`, `FLAC 16/44.1 kHz`, `aptX-HD` |
 | `decoded_format` | what came out of its decoder: `PCM 24/48 kHz, 2ch` — see *Three formats* |
 | `cover_url` | renderer artwork URL, empty otherwise |
@@ -340,10 +339,16 @@ every lossy source, and confusing them is easy:
 |---|---|---|
 | Source format | `source_format` | `aptX-HD` — a lossy codec has no bit depth of its own |
 | Decoded to | `decoded_format` | `PCM 24/48 kHz, 2ch` — what came out of the decoder |
-| Output format | `quality` | `32 bit / 48 kHz` — what the DAC is fed, largely its own doing |
+| Output format | *not published* | see below |
 
-`quality` is the one read from ALSA, so it works for every source including MPD.
-The other two are what the renderer says, and are empty off a renderer.
+**The output format is deliberately gone.** It used to be a `quality` sensor read
+from ALSA `hw_params`, and it overstated the resolution on every box whose chain
+pads: a 24-bit stream fed to a DAC taking `S32_LE` was reported as `32 bit`, and
+the padding carries no music. The figure described the container, not the
+recording. `decoded_format` is the honest one, and it is what moOde's own Audio
+Information calls *Decoded to*.
+
+Both keys are what the renderer says, so both are empty off a renderer.
 
 Three measured traps in those caches:
 
@@ -361,9 +366,6 @@ Three measured traps in those caches:
   address traffic actually leaves by. It is resolved again on every broker
   connection, so a changed network is followed. Set the option only for a
   reverse proxy or a similar special case.
-
-`quality` is read from ALSA `hw_params` rather than from MPD, precisely so it
-keeps working here: it is what the DAC is actually fed, whoever opened it.
 
 In automations, treat an empty field as "not provided":
 `{{ states('sensor.<id>_artist') | length > 0 }}` rather than a test against
@@ -437,7 +439,7 @@ Discovery is automatic: the box shows up as one device named after
 `friendly_name`. Entities, where `<id>` is your `instance` value:
 `binary_sensor.<id>_audio`, `binary_sensor.<id>_renderer`,
 `binary_sensor.<id>_display_power`, `binary_sensor.<id>_update`,
-`sensor.<id>_{state,title,artist,album,station,source,quality,display_app}`,
+`sensor.<id>_{state,title,artist,album,station,source,display_app}`,
 `number.<id>_volume`, `switch.<id>_mute`, and six buttons (play, pause, stop,
 toggle, next, previous).
 
