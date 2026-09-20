@@ -39,7 +39,8 @@ nano moode-mqtt.conf        # broker host, username, password, instance
 sudo ./install.sh
 ```
 
-The installer pulls `python3-paho-mqtt` and `python3-musicpd` from apt, installs
+The installer pulls `python3-paho-mqtt`, `python3-musicpd` and `python3-dbus`
+from apt — the last two ship with moOde, so that step is usually a no-op — installs
 the daemon and its systemd unit, then checks the things that can silently be
 wrong: a wrong password leaves the service `active` and mute, a failed `enable`
 leaves it working until the next reboot, and an unreachable REST API leaves it
@@ -59,18 +60,40 @@ To update later: `git pull` in that directory, then `sudo ./install.sh` again.
 It is re-runnable and only restarts what changed; your `moode-mqtt.conf` is
 never overwritten.
 
-**What to fill in.** Only the first block usually matters:
+**What to fill in.** The sample is commented throughout; these are the only keys
+that usually need a look, quoted exactly as it carries them:
 
 ```ini
 [broker]
 host = 192.168.1.x
-username =                  # leave empty for an anonymous broker
+port = 1883
+username =
 password =
+client_id = moode-mqtt
 
 [moode]
-instance = moode            # topic prefix and HA device id - pick it once
-friendly_name = moOde       # the name shown in Home Assistant
+instance = moode
+friendly_name = moOde
 ```
+
+- `host`, `port` — your broker. Leave `username` and `password` empty for an
+  anonymous one.
+- `client_id` — **must differ between boxes.** MQTT allows one connection per
+  client id, so two boxes sharing one kick each other off forever. See
+  [More than one box](#more-than-one-box).
+- `instance` — the topic prefix *and* the Home Assistant device id. Changing it
+  later creates a second device in HA, so pick it once.
+- `friendly_name` — the name shown in Home Assistant.
+
+**No comments at the end of a value line.** The daemon reads the file with
+Python's `ConfigParser`, which does not strip them: `username = bob  # my broker`
+gives a username of `bob  # my broker`. That is deliberate rather than an
+oversight — enabling inline comments would truncate any password containing a
+`#`, and passwords do. Put comments on their own line, as the sample does.
+
+Everything below those keys has a working default and its own comment in the
+file: poll interval, the audio-off debounce, the volume step, the artwork base
+URL and the update check.
 
 `moode-mqtt.conf` is **gitignored** — only `moode-mqtt.conf.sample` is
 committed, so a `git pull` never touches your credentials.
@@ -123,7 +146,8 @@ installer touches this add-on, which was verified rather than assumed:
   `/etc/moode-mqtt.conf`, `/etc/systemd/system/moode-mqtt.service` — and no
   moOde installer sweeps those directories;
 - no `pkill` or `killall` in moOde can match `moode-mqtt.py`;
-- no `autoremove` runs, so `python3-paho-mqtt` and `python3-musicpd` stay;
+- no `autoremove` runs, so `python3-paho-mqtt`, `python3-musicpd` and
+  `python3-dbus` stay;
 - the unit stays enabled, so it comes back on the reboot that follows.
 
 MPD restarts during an update and the bridge loses its connection; it reconnects
@@ -131,8 +155,8 @@ on its own, retrying every 5 s. Nothing to do.
 
 **What to check instead.** The risk is not the bridge disappearing — it is the
 bridge surviving and reading the new moOde wrongly. It duplicates a little of
-moOde's logic (ALSA format designators, the radio test, the renderer cache
-paths, `cfg_system` column names), and if a moOde release moves one of those,
+moOde's logic (the radio test, the renderer cache paths, `cfg_system` column
+names), and if a moOde release moves one of those,
 the bridge keeps publishing, quietly wrong. So after a **major** moOde update,
 look once at what comes out rather than reinstalling:
 
@@ -554,7 +578,7 @@ Assistant:
   as on x86, so the daemon reads it as `www-data`. This was the one thing that
   could have forced a different user, and it does not.
 - `www-data ALL=(ALL) NOPASSWD: ALL` is present on stock moOde too.
-- `python3-musicpd` is already installed; `python3-paho-mqtt` (2.1.0) comes from
+- `python3-musicpd` and `python3-dbus` are already installed; `python3-paho-mqtt` (2.1.0) comes from
   apt via `install.sh`.
 
 **Headless boxes**: that Pi had no local display (`localdisplay` disabled, no
@@ -592,15 +616,18 @@ through PHP too would fork php-fpm every second, forever, on hardware that may
 be a Pi. Commands are rare enough that the same cost is nothing.
 
 That split leaves **some duplicated logic** on the read side, and it is a real
-cost rather than a free choice: the ALSA format designators, the radio test and
-the renderer flags all exist in moOde already (`getAlsaHwParams()` in
-`inc/alsa.php`, `chkRendererActive()` in `inc/common.php`, the test in
-`inc/mpd.php`). The duplicated spots carry a pointer to their original; keep
-them in step when moving to a new moOde, and see *Updating moOde* above.
+cost rather than a free choice: the radio test, the renderer flags and the
+renderer cache paths all exist in moOde already (`chkRendererActive()` in
+`inc/common.php`, the test in `inc/mpd.php`, the cache constants in
+`inc/constants.php`). The duplicated spots carry a pointer to their original;
+keep them in step when moving to a new moOde, and see *Updating moOde* above.
 
-One case makes that cost concrete: `IEC958_SUBFRAME_LE`, the S/PDIF designator,
-contains digits that are not a bit depth. moOde handles it explicitly; this
-parser first reported `958 bit / 44.1 kHz` for it.
+That cost used to be higher. The bridge once parsed the ALSA format designators
+itself to report an output format, and got `IEC958_SUBFRAME_LE` wrong — the
+S/PDIF designator contains digits that are not a bit depth, and it published
+`958 bit / 44.1 kHz` until a comparison with `getAlsaHwParams()` caught it.
+Dropping that sensor took the whole parser with it: the substream is now only
+asked whether it is open, which no moOde release is going to change.
 
 Note that a PHP daemon — the natural way to `require` moOde's includes, as
 `worker.php` and `touchmon.php` do — is not an option here: `apt-cache search
