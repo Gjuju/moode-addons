@@ -679,6 +679,7 @@ cannot drive — through that renderer's own daemon.
 
 **Runs as `www-data`**, the web server user — the sqlite DB is owned by
 `www-data`, so a root daemon would leave root-owned journal files behind.
-`www-data` has NOPASSWD sudo in moOde, but the bridge does not rely on it:
-reading `xset q` needs no privilege, since Xorg runs with no auth file. `sudo`
-is kept only as a fallback for a setup that would refuse the plain call.
+`www-data` has NOPASSWD sudo in moOde, but the bridge never uses it: nothing it
+does is privileged. Reading `xset q` looked like it needed sudo and does not —
+Xorg runs with no auth file — and a failing `sudo` on a box with no X costs
+68 ms of CPU against 7.5 for the plain call.

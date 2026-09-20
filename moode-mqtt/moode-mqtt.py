@@ -188,9 +188,6 @@ UPDATE_CHECK_INTERVAL = 12 * 3600
 # 3 s, so there is no point being quicker than the thing being watched.
 DISPLAY_RECHECK = 10.0
 
-# Which invocation of xset actually answered, remembered after the first call.
-_XSET_PREFIX = None
-
 # cfg_system flags moOde sets while a non-MPD source is playing (common.php,
 # chkRendererActive()), each with the label its own WebUI shows (playerlib.js).
 RENDERER_LABELS = (
@@ -360,28 +357,25 @@ def display_power():
     (input inactivity, no relation to audio). This reports the result of either,
     which is why it must not be used to decide whether the amp should be on.
     """
-    global _XSET_PREFIX
+    # No sudo: moOde runs Xorg as root with no auth file, so www-data reaches it
+    # directly. Verified on every box here that has an X server, a stock Pi
+    # included. It is not a style preference - the same call through sudo costs
+    # 51 ms of CPU on a Pi 3 against 6.3 plain, and on a box with no X at all it
+    # is 68 ms to fail rather than 7.5.
     env = dict(os.environ, DISPLAY=':0')
-    # Nothing here is privileged: moOde runs X as root with no auth file, so
-    # www-data reaches it directly. Measured, same answer either way: 3.86 ms of
-    # CPU plain against 25.83 through sudo, which is PAM and sudoers parsing for
-    # a question about a screen. sudo stays as a fallback for a box whose X does
-    # demand authorisation - not a case this could test.
-    attempts = [_XSET_PREFIX] if _XSET_PREFIX is not None else [[], ['sudo', '-E']]
+    try:
+        out = subprocess.run(['xset', 'q'], env=env, timeout=5,
+                             capture_output=True, text=True).stdout
+    except (subprocess.SubprocessError, OSError):
+        return 'unknown'
 
-    for prefix in attempts:
-        try:
-            out = subprocess.run(prefix + ['xset', 'q'], env=env, timeout=5,
-                                 capture_output=True, text=True).stdout
-        except (subprocess.SubprocessError, OSError):
-            continue
-        for line in out.splitlines():
-            if 'Monitor is ' in line:
-                _XSET_PREFIX = prefix
-                # "Monitor is On" / "in Standby" / "in Suspend" / "Off" - the
-                # state is not always one word, so keep everything after it.
-                state = line.split('Monitor is ', 1)[1].strip()
-                return 'on' if state == 'On' else 'standby'
+    for line in out.splitlines():
+        if 'Monitor is ' in line:
+            # "Monitor is On" / "in Standby" / "in Suspend" / "Off" - the state
+            # is not always one word, so keep everything after the marker. moOde
+            # takes the third field here, which yields "in" for a standby.
+            state = line.split('Monitor is ', 1)[1].strip()
+            return 'on' if state == 'On' else 'standby'
     return 'unknown'
 
 
