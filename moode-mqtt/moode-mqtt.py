@@ -543,9 +543,14 @@ def dbus_props_all(service, path, interface):
     Measured: a round trip costs about 2 ms whatever comes back - GetAll over an
     interface carrying 25 properties timed the same as Get on one of them. So
     reading properties one at a time buys nothing and costs a round trip each.
+
+    introspect=False throughout, here and in every other call: dbus-python
+    otherwise Introspects each proxy it builds, which measured 1.29 ms against
+    0.69 for the same GetAll. Nothing here uses the introspected API - every call
+    names its interface explicitly.
     """
     try:
-        obj = dbus_bus().get_object(service, path)
+        obj = dbus_bus().get_object(service, path, introspect=False)
         return dbus.Interface(obj, DBUS_PROPS).GetAll(interface)
     except Exception:
         return None
@@ -553,7 +558,7 @@ def dbus_props_all(service, path, interface):
 
 def dbus_set_prop(service, path, interface, name, value):
     try:
-        obj = dbus_bus().get_object(service, path)
+        obj = dbus_bus().get_object(service, path, introspect=False)
         dbus.Interface(obj, DBUS_PROPS).Set(interface, name, value)
         return True
     except Exception as err:
@@ -563,7 +568,7 @@ def dbus_set_prop(service, path, interface, name, value):
 
 def dbus_call(service, path, interface, method, *args):
     try:
-        obj = dbus_bus().get_object(service, path)
+        obj = dbus_bus().get_object(service, path, introspect=False)
         getattr(dbus.Interface(obj, interface), method)(*args)
         return True
     except Exception as err:
@@ -578,7 +583,7 @@ def dbus_find(service, interface, root='/'):
     changes with every phone that connects.
     """
     try:
-        obj = dbus_bus().get_object(service, root)
+        obj = dbus_bus().get_object(service, root, introspect=False)
         managed = dbus.Interface(obj, DBUS_OBJMGR).GetManagedObjects()
     except Exception:
         return None
