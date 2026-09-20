@@ -40,8 +40,9 @@ sudo ./install.sh
 ```
 
 The installer pulls `python3-paho-mqtt`, `python3-musicpd` and `python3-dbus`
-from apt — the last two ship with moOde, so that step is usually a no-op — installs
-the daemon and its systemd unit, then checks the things that can silently be
+from apt — the last two ship with moOde, so that step is usually a no-op —
+installs the daemon into `/usr/local/lib/moode-mqtt/` with its systemd unit,
+then checks the things that can silently be
 wrong: a wrong password leaves the service `active` and mute, a failed `enable`
 leaves it working until the next reboot, and an unreachable REST API leaves it
 publishing state while accepting no command at all. Expect:
@@ -142,7 +143,7 @@ ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
 **Nothing to reinstall.** Neither a moOde update nor a re-run of a moOde
 installer touches this add-on, which was verified rather than assumed:
 
-- the bridge shares no file with moOde — `/usr/local/bin/moode-mqtt.py`,
+- the bridge shares no file with moOde — `/usr/local/lib/moode-mqtt/`,
   `/etc/moode-mqtt.conf`, `/etc/systemd/system/moode-mqtt.service` — and no
   moOde installer sweeps those directories;
 - no `pkill` or `killall` in moOde can match `moode-mqtt.py`;

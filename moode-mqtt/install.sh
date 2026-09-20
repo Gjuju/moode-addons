@@ -30,6 +30,9 @@ if [ ! -f "$SRC_DIR/moode-mqtt.conf" ]; then
 	exit 1
 fi
 
+LIBDIR=/usr/local/lib/moode-mqtt
+LEGACY_BIN=/usr/local/bin/moode-mqtt.py
+
 CHANGED_ANY=0
 CHANGED_UNIT=0
 
@@ -69,14 +72,30 @@ fi
 
 say
 say "-- Files"
+# The daemon is several modules now, so it lives in its own directory rather
+# than in /usr/local/bin - a shared directory of executables is no place for
+# importable module names like backends.py, which anything else running from
+# there could collide with. Python puts the running script's directory first on
+# its import path, so the modules find each other with no packaging at all.
+install -d -o root -g root -m 0755 "$LIBDIR"
+deploy moode-mqtt.py      $LIBDIR/moode-mqtt.py                   0755 root:root
+deploy moode.py           $LIBDIR/moode.py                        0644 root:root
+deploy backends.py        $LIBDIR/backends.py                     0644 root:root
 # 0640 root:www-data: the config carries the broker password and the service
 # runs as www-data.
-deploy moode-mqtt.py      /usr/local/bin/moode-mqtt.py            0755 root:root
 deploy moode-mqtt.conf    /etc/moode-mqtt.conf                    0640 root:www-data
 deploy moode-mqtt.service /etc/systemd/system/moode-mqtt.service  0644 root:root
 # The daemon runs as www-data and cannot read the clone (the player's home is
 # 0700), so the installed version has to be readable outside it.
 deploy VERSION            /etc/moode-mqtt.version                 0644 root:root
+
+# Up to 1.2.0 the daemon was a single file in /usr/local/bin. Leaving it there
+# would strand a copy that looks like the program but is never run.
+if [ -f "$LEGACY_BIN" ]; then
+	rm -f "$LEGACY_BIN"
+	ok "removed the pre-1.3 $LEGACY_BIN"
+fi
+find "$LIBDIR" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null
 
 say
 say "-- Service"

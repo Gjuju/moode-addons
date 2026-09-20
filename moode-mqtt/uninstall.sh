@@ -18,7 +18,9 @@
 set -u
 
 CONF=/etc/moode-mqtt.conf
-BIN=/usr/local/bin/moode-mqtt.py
+LIBDIR=/usr/local/lib/moode-mqtt
+# Where the daemon lived up to 1.2.0, removed too so nothing is left behind.
+LEGACY_BIN=/usr/local/bin/moode-mqtt.py
 UNIT=/etc/systemd/system/moode-mqtt.service
 
 say()  { printf '%s\n' "$*"; }
@@ -106,7 +108,7 @@ fi
 
 say
 say "-- Files"
-for f in "$UNIT" "$BIN" "$CONF"; do
+for f in "$UNIT" "$LEGACY_BIN" "$CONF"; do
 	if [ -f "$f" ]; then
 		rm -f "$f"
 		ok "removed  $f"
@@ -114,6 +116,12 @@ for f in "$UNIT" "$BIN" "$CONF"; do
 		say "     absent   $f"
 	fi
 done
+if [ -d "$LIBDIR" ]; then
+	rm -rf "$LIBDIR"
+	ok "removed  $LIBDIR"
+else
+	say "     absent   $LIBDIR"
+fi
 systemctl daemon-reload
 
 if [ "$PURGE_DEPS" = 1 ]; then
