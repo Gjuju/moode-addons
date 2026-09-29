@@ -139,6 +139,33 @@ scp moode-mqtt.conf.pi moode@<box>:~/moode-mqtt/moode-mqtt.conf
 ssh moode@<box> 'cd ~/moode-mqtt && sudo ./install.sh'
 ```
 
+### TLS
+
+Off by default. For a broker that listens in TLS — Home Assistant's Mosquitto
+add-on does on `8883` once `certfile` and `keyfile` are set:
+
+```ini
+port = 8883
+tls = yes
+tls_server_name = <the name on the broker's certificate>
+```
+
+- The certificate is **fully verified**, chain and name, against the system's
+  CAs: a public certificate such as Let's Encrypt passes, a self-signed one or
+  one from a private CA does not.
+- `tls_server_name` is for connecting **by IP** to a broker whose certificate
+  names a domain — the usual LAN case with a Let's Encrypt certificate. That
+  name is only checked against the certificate, never looked up, so the
+  connection stays on the LAN. Leave it empty when the certificate names the
+  address you dial.
+- A refused connection is logged **once**, with its reason: a name mismatch,
+  TLS against a plain port, an expired certificate. Without that it would
+  retry forever in silence.
+- The certificate must carry a Subject Alternative Name: Python no longer
+  falls back to the CN.
+- Not supported: client certificates (`require_certificate: true`) and MQTT
+  over WebSockets.
+
 ## Updating moOde
 
 **Nothing to reinstall.** Neither a moOde update nor a re-run of a moOde

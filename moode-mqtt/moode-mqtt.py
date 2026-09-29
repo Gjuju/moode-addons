@@ -32,6 +32,7 @@ import json
 import os
 import signal
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -91,6 +92,34 @@ def local_address(host, port):
             sock.close()
     except OSError:
         return ''
+
+
+class NamedTLSContext(ssl.SSLContext):
+    """Verifies the certificate against `server_name` instead of the host dialled.
+
+    paho has no option for it: it hands its connect host to wrap_socket as the
+    name to check. That breaks the usual LAN case of a public certificate - a
+    Let's Encrypt one for example - reached by IP, since the certificate names a
+    domain and not the address. Measured: dialling the IP while checking the
+    certificate's name passes full verification; dialling the name went to the
+    public address instead, where the broker is not listening.
+    """
+
+    server_name = None
+
+    def wrap_socket(self, sock, *args, server_hostname=None, **kwargs):
+        return super().wrap_socket(sock, *args,
+                                   server_hostname=self.server_name or server_hostname,
+                                   **kwargs)
+
+
+def tls_context(cfg):
+    """Full verification, chain and name, against the system's CAs: a public
+    certificate such as Let's Encrypt passes, a self-signed one does not."""
+    ctx = NamedTLSContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_default_certs()
+    ctx.server_name = cfg['tls_server_name'] or None
+    return ctx
 
 
 def installed_version():
@@ -154,6 +183,8 @@ def load_config():
         'username': broker.get('username', '') or None,
         'password': broker.get('password', '') or None,
         'client_id': broker.get('client_id', 'moode-mqtt'),
+        'tls': (broker.get('tls', 'no') or 'no').lower() in ('yes', 'true', '1', 'on'),
+        'tls_server_name': (broker.get('tls_server_name', '') or '').strip(),
         'instance': moode.get('instance', 'moode'),
         'friendly_name': moode.get('friendly_name', 'moOde'),
         'prefix': moode.get('topic_prefix', 'moode'),
@@ -216,9 +247,13 @@ class Bridge:
 
         if cfg['username']:
             self.client.username_pw_set(cfg['username'], cfg['password'])
+        if cfg['tls']:
+            self.client.tls_set_context(tls_context(cfg))
         self.client.will_set(self.topic('availability'), 'offline', retain=True)
         self.client.on_connect = self.on_connect
+        self.client.on_connect_fail = self.on_connect_fail
         self.client.on_message = self.on_message
+        self.connect_problem = None
 
     def resolve_web_base(self):
         """Configured value wins; otherwise detect, falling back to mDNS."""
@@ -260,9 +295,11 @@ class Bridge:
         # paho 2.x hands over a ReasonCode, 1.x a plain int.
         failure = getattr(rc, 'is_failure', None)
         if failure if failure is not None else rc != 0:
-            log('MQTT connect failed rc=%s' % rc)
+            self.connect_failed('broker refused: %s' % rc)
             return
-        log('MQTT connected to %s:%s' % (self.cfg['host'], self.cfg['port']))
+        self.connect_problem = None
+        log('MQTT connected to %s:%s%s' % (self.cfg['host'], self.cfg['port'],
+                                           ' (TLS)' if self.cfg['tls'] else ''))
         client.publish(self.topic('availability'), 'online', retain=True)
         self.resolve_web_base()
         for sub in ('cmd/volume', 'cmd/mute', 'cmd/transport'):
@@ -273,6 +310,23 @@ class Bridge:
         self.published.clear()
         self.player_sig = None
         self.wake.set()
+
+    def on_connect_fail(self, client, userdata):
+        """paho retries a failed connection on its own and says nothing: it logs
+        at debug level only, without the reason. It calls this from inside the
+        except block that caught the failure, so that exception is still the
+        one being handled - a certificate refused, TLS against a plain port, a
+        broker that is down."""
+        err = sys.exc_info()[1]
+        self.connect_failed(str(err) if err else 'no reason given')
+
+    def connect_failed(self, problem):
+        # Once per problem, not once per retry: a warning repeated every
+        # backoff interval teaches everyone to ignore the log.
+        if problem != self.connect_problem:
+            log('MQTT connection to %s:%s failed: %s' % (
+                self.cfg['host'], self.cfg['port'], problem))
+            self.connect_problem = problem
 
     def on_message(self, client, userdata, msg):
         payload = msg.payload.decode('utf-8', 'replace').strip()

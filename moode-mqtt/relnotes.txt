@@ -4,6 +4,15 @@ moode-mqtt release notes
 Newest first.
 
 
+1.5.0  2026-09-29
+FEAT:
+- Optional TLS to the broker: `tls = yes`, plus `tls_server_name` when host is
+  an IP address.
+
+FIX:
+- A failed broker connection was retried in silence; its reason is now logged.
+
+
 1.4.0  2026-09-20
 FEAT:
 - Squeezelite gains transport, volume and mute, through its LMS server.

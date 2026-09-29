@@ -13,6 +13,12 @@ password =
 # One connection per client id: give each box its own.
 client_id = moode-mqtt
 
+# Encrypt the connection to the broker. Set port to 8883 with it.
+tls = no
+# Only if host above is an IP address: the domain name your broker's
+# certificate was issued for, e.g. myhome.duckdns.org. Leave empty otherwise.
+tls_server_name =
+
 [moode]
 # Used in every topic and as the Home Assistant device id. Pick it once:
 # changing it later creates a second device.
