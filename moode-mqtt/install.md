@@ -58,9 +58,11 @@ publishing state while accepting no command at all. Expect:
 The entities appear in Home Assistant on their own, under a device named after
 `friendly_name`. Nothing to add to your HA configuration.
 
-To update later: `git pull` in that directory, then `sudo ./install.sh` again.
-It is re-runnable and only restarts what changed; your `moode-mqtt.conf` is
-never overwritten.
+To update later, in that directory: `git fetch && git reset --hard origin/main`,
+then `sudo ./install.sh` again. Rather than `git pull`, which stops dead if the
+published history was ever rewritten. It discards local edits to the add-on's
+own files, but never your `moode-mqtt.conf`, which git does not track. The
+installer is re-runnable and only restarts what changed.
 
 **What to fill in.** The sample is commented throughout; these are the only keys
 that usually need a look, quoted exactly as it carries them:
@@ -98,7 +100,7 @@ file: poll interval, the audio-off debounce, the volume step, the artwork base
 URL and the update check.
 
 `moode-mqtt.conf` is **gitignored** — only `moode-mqtt.conf.sample` is
-committed, so a `git pull` never touches your credentials.
+committed, so updating never touches your credentials.
 
 **Edit the copy in this directory, not the one in `/etc`.** The installer copies
 this directory's `moode-mqtt.conf` to `/etc/moode-mqtt.conf`, so changes made
@@ -202,10 +204,11 @@ The one case that does need `sudo ./install.sh` again is updating **the bridge
 itself**:
 
 ```bash
-cd moode-addons && git pull && cd moode-mqtt && sudo ./install.sh
+cd moode-addons && git fetch && git reset --hard origin/main && cd moode-mqtt && sudo ./install.sh
 ```
 
-Your `moode-mqtt.conf` is gitignored, so a pull never touches your credentials.
+Your `moode-mqtt.conf` is gitignored, so the update never touches your
+credentials.
 
 ## Uninstall
 
