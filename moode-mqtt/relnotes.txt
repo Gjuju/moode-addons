@@ -96,6 +96,9 @@ FEAT:
 Upgrading
 ---------
 
-    cd moode-addons && git fetch && git reset --hard origin/main && cd moode-mqtt && sudo ./install.sh
+    cd moode-addons
+    git pull
+    cd moode-mqtt
+    sudo ./install.sh
 
 moode-mqtt.conf is gitignored and never overwritten.

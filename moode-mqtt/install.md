@@ -58,11 +58,9 @@ publishing state while accepting no command at all. Expect:
 The entities appear in Home Assistant on their own, under a device named after
 `friendly_name`. Nothing to add to your HA configuration.
 
-To update later, in that directory: `git fetch && git reset --hard origin/main`,
-then `sudo ./install.sh` again. Rather than `git pull`, which stops dead if the
-published history was ever rewritten. It discards local edits to the add-on's
-own files, but never your `moode-mqtt.conf`, which git does not track. The
-installer is re-runnable and only restarts what changed.
+To update later: `git pull` in that directory, then `sudo ./install.sh` again
+(see *Updating moOde* for the full commands). The installer is re-runnable and
+only restarts what changed.
 
 **What to fill in.** The sample is commented throughout; these are the only keys
 that usually need a look, quoted exactly as it carries them:
@@ -204,8 +202,15 @@ The one case that does need `sudo ./install.sh` again is updating **the bridge
 itself**:
 
 ```bash
-cd moode-addons && git fetch && git reset --hard origin/main && cd moode-mqtt && sudo ./install.sh
+cd moode-addons
+git pull
+cd moode-mqtt
+sudo ./install.sh
 ```
+
+If `git pull` refuses with "divergent branches" (the published history was
+rewritten once, in September 2026), run this once instead of `git pull`:
+`git fetch && git reset --hard origin/main`.
 
 Your `moode-mqtt.conf` is gitignored, so the update never touches your
 credentials.
