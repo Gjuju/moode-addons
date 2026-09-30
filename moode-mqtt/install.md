@@ -58,8 +58,8 @@ publishing state while accepting no command at all. Expect:
 The entities appear in Home Assistant on their own, under a device named after
 `friendly_name`. Nothing to add to your HA configuration.
 
-To update later: `git pull` in that directory, then `sudo ./install.sh` again
-(see *Updating moOde* for the full commands). The installer is re-runnable and
+To update later: `git fetch && git reset --hard origin/main` in that directory,
+then `sudo ./install.sh` again (see *Updating moOde* for the full commands). The installer is re-runnable and
 only restarts what changed.
 
 **What to fill in.** The sample is commented throughout; these are the only keys
@@ -203,14 +203,10 @@ itself**:
 
 ```bash
 cd moode-addons
-git pull
+git fetch && git reset --hard origin/main
 cd moode-mqtt
 sudo ./install.sh
 ```
-
-If `git pull` refuses with "divergent branches" (the published history was
-rewritten once, in September 2026), run this once instead of `git pull`:
-`git fetch && git reset --hard origin/main`.
 
 Your `moode-mqtt.conf` is gitignored, so the update never touches your
 credentials.
