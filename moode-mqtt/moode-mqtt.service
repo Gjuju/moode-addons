@@ -18,6 +18,9 @@ Group=www-data
 ExecStart=/usr/local/lib/moode-mqtt/moode-mqtt.py
 Restart=always
 RestartSec=5
+# 3: moOde's built-in MQTT bridge is on, so the add-on steps aside for good
+SuccessExitStatus=3
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=multi-user.target

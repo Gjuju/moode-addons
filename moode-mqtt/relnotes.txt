@@ -4,6 +4,21 @@ moode-mqtt release notes
 Newest first.
 
 
+1.6.0  2026-09-30
+FEAT:
+- Steps aside when moOde's built-in MQTT is on, and logs how to uninstall.
+  With the same instance, the device stays online under moOde's bridge.
+
+CHANGE:
+- uninstall.sh asks before clearing the retained topics [Y/n], and does not
+  ask when moOde's built-in MQTT publishes the same instance. Dependencies are
+  kept: --purge-deps and --keep-retained are gone.
+
+FIX:
+- uninstall.sh left /etc/moode-mqtt.version behind.
+- A `%` in the broker password no longer stops uninstall.sh clearing topics.
+
+
 1.5.1  2026-09-30
 FIX:
 - A `%` in the broker password stopped the bridge at startup.

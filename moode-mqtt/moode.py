@@ -47,6 +47,17 @@ def db_read(params):
         return {}
 
 
+def builtin_instance():
+    """Instance of moOde's built-in MQTT bridge, or '' when it has none yet."""
+    try:
+        conn = sqlite3.connect('file:%s?mode=ro' % SQLDB, uri=True, timeout=2)
+        row = conn.execute("SELECT value FROM cfg_mqtt WHERE param = 'instance'").fetchone()
+        conn.close()
+        return row[0] if row else ''
+    except sqlite3.Error:
+        return ''
+
+
 # How moOde decides something is a radio stream (inc/mpd.php): an http file with
 # no duration. The WebUI then shows "Radio station" as the artist and uses that
 # label to pick stop-over-pause, but the label only exists in moOde's own PHP

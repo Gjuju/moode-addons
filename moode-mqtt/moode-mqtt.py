@@ -43,8 +43,8 @@ import paho.mqtt.client as mqtt
 
 from backends import (AirPlayBackend, BluezBackend, MoodeBackend, PibuzBackend,
                       SqueezeliteBackend, TRANSPORT_ALIASES, TRANSPORT_VERBS)
-from moode import (DISPLAY_RECHECK, RENDERER_FLAGS, RENDERER_LABELS, db_read,
-                   display_power, display_source, is_radio_stream, log,
+from moode import (DISPLAY_RECHECK, RENDERER_FLAGS, RENDERER_LABELS, builtin_instance,
+                   db_read, display_power, display_source, is_radio_stream, log,
                    moode_release, output_is_open, read_renderer_meta,
                    volume_scope)
 
@@ -70,6 +70,8 @@ UPDATE_CHECK_INTERVAL = 12 * 3600
 # has run a version that retired it.
 RETIRED_ENTITIES = (('sensor', 'quality'),)
 
+# moOde's built-in MQTT bridge is on: stop for good (see moode-mqtt.service).
+EXIT_HANDOVER = 3
 
 running = True
 
@@ -212,6 +214,7 @@ class Bridge:
     def __init__(self, cfg):
         self.cfg = cfg
         self.base = '%s/%s' % (cfg['prefix'], cfg['instance'])
+        self.handed_over = False
         self.wake = threading.Event()
         self.published = {}
         self.player_sig = None
@@ -419,7 +422,12 @@ class Bridge:
         cfg_rows = db_read(list(RENDERER_FLAGS) +
                            ['volknob', 'volmute', 'cardnum', 'multiroom_tx', 'mpdmixer',
                             'local_display', 'peppy_display', 'rxactive',
-                            'audioin'])
+                            'audioin', 'mqttsvc'])
+        if cfg_rows.get('mqttsvc') == '1':
+            global running
+            running = False
+            self.handed_over = True
+            return
 
         if self.backend is not None:
             # One snapshot per cycle: see DBusBackend.
@@ -775,7 +783,12 @@ class Bridge:
             except Exception as err:
                 log('publish cycle failed: %s' % err)
 
-        self.client.publish(self.topic('availability'), 'offline', retain=True)
+        if self.handed_over and builtin_instance() == self.cfg['instance']:
+            # A clean disconnect drops the will: no 'offline' over the built-in
+            # bridge, which publishes the same topics.
+            self.client.disconnect()
+        else:
+            self.client.publish(self.topic('availability'), 'offline', retain=True)
         self.client.loop_stop()
 
 
@@ -788,9 +801,22 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     cfg = load_config()
-    log('moode-mqtt starting: instance=%s broker=%s:%s' %
-        (cfg['instance'], cfg['host'], cfg['port']))
-    Bridge(cfg).run()
+    if db_read(['mqttsvc']).get('mqttsvc') != '1':
+        log('moode-mqtt starting: instance=%s broker=%s:%s' %
+            (cfg['instance'], cfg['host'], cfg['port']))
+        bridge = Bridge(cfg)
+        bridge.run()
+        if not bridge.handed_over:
+            return
+
+    log("moOde's built-in MQTT is on: moode-mqtt stops. Uninstall it: sudo ./uninstall.sh")
+    instance = builtin_instance()
+    if instance and instance != cfg['instance']:
+        log("moOde publishes this player as instance '%s', moode-mqtt used '%s'."
+            " To keep the same Home Assistant device, Remove it in System Config,"
+            " then set Instance to '%s' in moOde's MQTT settings."
+            % (instance, cfg['instance'], cfg['instance']))
+    sys.exit(EXIT_HANDOVER)
 
 
 if __name__ == '__main__':

@@ -3,17 +3,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 Julien Gainza
 #
-# Removes the moOde MQTT bridge.
+# Removes the moOde MQTT bridge: the systemd unit and the files install.sh left.
+# Dependencies are kept. It asks whether to also remove the device from the home
+# automation system, by clearing the retained topics this box published.
 #
-# By default it first clears the retained topics this box published. That step
-# matters: the bridge publishes retained, so without it Home Assistant keeps the
-# device forever, greyed out as unavailable, long after the daemon is gone.
-#
-# Usage: sudo ./uninstall.sh [--keep-retained] [--purge-deps]
-#
-#   --keep-retained  leave the broker alone (use when reinstalling shortly)
-#   --purge-deps     also apt purge python3-paho-mqtt (installed by install.sh;
-#                    python3-musicpd is left alone, moOde ships it)
+# Usage: sudo ./uninstall.sh
 
 set -u
 
@@ -22,29 +16,21 @@ LIBDIR=/usr/local/lib/moode-mqtt
 # Where the daemon lived up to 1.2.0, removed too so nothing is left behind.
 LEGACY_BIN=/usr/local/bin/moode-mqtt.py
 UNIT=/etc/systemd/system/moode-mqtt.service
+VERSION_FILE=/etc/moode-mqtt.version
+SQLDB=/var/local/www/db/moode-sqlite3.db
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '[ok] %s\n' "$*"; }
 warn() { printf '[!]  %s\n' "$*"; }
-
-KEEP_RETAINED=0
-PURGE_DEPS=0
-for arg in "$@"; do
-	case $arg in
-		--keep-retained) KEEP_RETAINED=1 ;;
-		--purge-deps)    PURGE_DEPS=1 ;;
-		*) warn "unknown option: $arg"; exit 1 ;;
-	esac
-done
 
 if [ "$(id -u)" != 0 ]; then
 	warn "run me as root: sudo $0"
 	exit 1
 fi
 
-# Stop first, so nothing republishes what we are about to clear.
+# Stop first, so nothing republishes what we may clear.
 say "-- Service"
-if systemctl list-unit-files moode-mqtt.service >/dev/null 2>&1 && [ -f "$UNIT" ]; then
+if [ -f "$UNIT" ]; then
 	systemctl stop moode-mqtt 2>/dev/null
 	systemctl disable --quiet moode-mqtt 2>/dev/null
 	ok "stopped and disabled"
@@ -54,15 +40,22 @@ fi
 
 say
 say "-- Broker"
-if [ "$KEEP_RETAINED" = 1 ]; then
-	say "     --keep-retained: leaving retained topics in place"
-	say "     (Home Assistant will keep showing this device as unavailable)"
-elif [ ! -f "$CONF" ]; then
-	warn "$CONF is gone, cannot reach the broker to clear retained topics"
-	warn "  Home Assistant will keep this device until you clear them by hand"
+INST=$(sed -n 's/^instance *= *//p' "$CONF" 2>/dev/null)
+INST=${INST:-moode}
+BUILTIN_INST=""
+if [ "$(sqlite3 "$SQLDB" "SELECT value FROM cfg_system WHERE param='mqttsvc'" 2>/dev/null)" = 1 ]; then
+	BUILTIN_INST=$(sqlite3 "$SQLDB" "SELECT value FROM cfg_mqtt WHERE param='instance'" 2>/dev/null)
+fi
+if [ ! -f "$CONF" ]; then
+	say "     $CONF is gone, retained topics left in place"
+elif [ "$INST" = "$BUILTIN_INST" ]; then
+	say "     moOde's built-in MQTT publishes instance '$INST' now, retained topics kept"
 else
-	# The config is still here, so we know where to connect and as whom. Clear
-	# every retained topic by publishing an empty retained payload over it.
+	read -r -p "Remove the device from the home automation system? [Y/n] " answer
+	case $answer in
+		[nN]*) say "     retained topics kept" ;;
+		*)
+	# Clear every retained topic by publishing an empty retained payload over it.
 	python3 - "$CONF" <<'PY'
 import configparser, sys, time
 try:
@@ -71,7 +64,7 @@ except ImportError:
     print("     python3-paho-mqtt is gone, cannot clear retained topics")
     sys.exit(0)
 
-cp = configparser.ConfigParser(); cp.read(sys.argv[1])
+cp = configparser.ConfigParser(interpolation=None); cp.read(sys.argv[1])
 b = cp["broker"]; m = cp["moode"]
 inst = m.get("instance", "moode")
 prefix = m.get("topic_prefix", "moode")
@@ -104,11 +97,13 @@ time.sleep(3)
 print("[ok] cleared %d retained topics for instance '%s'" % (len(found), inst))
 cl.loop_stop()
 PY
+			;;
+	esac
 fi
 
 say
 say "-- Files"
-for f in "$UNIT" "$LEGACY_BIN" "$CONF"; do
+for f in "$UNIT" "$LEGACY_BIN" "$CONF" "$VERSION_FILE"; do
 	if [ -f "$f" ]; then
 		rm -f "$f"
 		ok "removed  $f"
@@ -123,17 +118,6 @@ else
 	say "     absent   $LIBDIR"
 fi
 systemctl daemon-reload
-
-if [ "$PURGE_DEPS" = 1 ]; then
-	say
-	say "-- Dependencies"
-	# Only what install.sh added and nothing else uses; musicpd belongs to moOde.
-	if dpkg -s python3-paho-mqtt >/dev/null 2>&1; then
-		apt-get purge -y python3-paho-mqtt && ok "purged python3-paho-mqtt"
-	else
-		say "     python3-paho-mqtt not installed"
-	fi
-fi
 
 say
 say "Done. The config carried the broker password and has been removed;"
