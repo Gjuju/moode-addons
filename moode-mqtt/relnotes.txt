@@ -4,6 +4,11 @@ moode-mqtt release notes
 Newest first.
 
 
+1.5.1  2026-09-30
+FIX:
+- A `%` in the broker password stopped the bridge at startup.
+
+
 1.5.0  2026-09-29
 FEAT:
 - Optional TLS to the broker: `tls = yes`, plus `tls_server_name` when host is

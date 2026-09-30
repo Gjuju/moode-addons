@@ -172,7 +172,7 @@ def load_config():
         log('FATAL: %s not found (copy moode-mqtt.conf.sample)' % CONF_PATH)
         sys.exit(1)
 
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     parser.read(CONF_PATH)
     broker = parser['broker']
     moode = parser['moode'] if parser.has_section('moode') else {}
